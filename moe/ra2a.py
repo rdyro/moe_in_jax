@@ -21,18 +21,19 @@ class RDMACopy:
 
 # synchronous ra2a 2D kernel ###########################################################################################
 
+multiple_of = lambda a, b: (a // b) * b
 
 def _ra2a_2d_kernel_sync(
-  src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems, *, axis_name
+  src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems, *, axis_name, multiple: int
 ):
   del out_ref  # aliased in dst_ref
   idx, n_devices = jax.lax.axis_index(axis_name), jax.lax.axis_size(axis_name)
-  raise NotImplementedError("This is a 3D version, it needs to be adapted to 2D.")
+  #raise NotImplementedError("This is a 3D version, it needs to be adapted to 2D.")
 
   def make_dma(id):
     sem_id = lax.rem(idx + idx, n_devices)
-    src = src_ref.at[pl.ds(input_offsets[id], send_sizes[id]), ...]
-    dst = dst_ref.at[pl.ds(output_offsets[id], send_sizes[id]), ...]
+    src = src_ref.at[pl.ds(multiple_of(input_offsets[id], multiple), multiple_of(send_sizes[id], multiple)), ...]
+    dst = dst_ref.at[pl.ds(multiple_of(output_offsets[id], multiple), multiple_of(send_sizes[id], multiple)), ...]
     copy = pltpu.make_async_copy(src, dst, sems.at[0, sem_id, 1])
     return RDMACopy(copy, copy.start, copy.wait)
 
@@ -42,8 +43,8 @@ def _ra2a_2d_kernel_sync(
   def make_rdma(other_id, send: bool = True):
     src_id, dst_id = (idx, other_id) if send else (other_id, idx)
     size = lax.select(idx == src_id, send_sizes[dst_id], recv_sizes[src_id])
-    src = src_ref.at[pl.ds(input_offsets[dst_id], size), ...]
-    dst = dst_ref.at[pl.ds(output_offsets[dst_id], size), ...]
+    src = src_ref.at[pl.ds(multiple_of(input_offsets[dst_id], multiple), multiple_of(size, multiple)), ...]
+    dst = dst_ref.at[pl.ds(multiple_of(output_offsets[dst_id], multiple), multiple_of(size, multiple)), ...]
     sem_id, direction_id = lax.rem(idx + other_id, n_devices), (src_id > dst_id).astype(jnp.int32)
     send_sem = sems.at[sem_id, direction_id, 0]
     recv_sem = sems.at[sem_id, direction_id, 1]
@@ -62,13 +63,11 @@ def _ra2a_2d_kernel_sync(
   dma_copy.wait()
 
 
-@partial(jax.jit, static_argnames=("axis_name",))
-def ra2a(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, *, axis_name: str = "x"):
-  raise NotImplementedError("This is a 3D version, it needs to be adapted to 2D.")
-
+@partial(jax.jit, static_argnames=("axis_name", "multiple"))
+def ra2a_2d(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, *, axis_name: str = "x", multiple: int):
   n_devices = jax.lax.axis_size(axis_name)
   out = pl.pallas_call(
-    partial(_ra2a_2d_kernel_sync, axis_name=axis_name),
+    partial(_ra2a_2d_kernel_sync, axis_name=axis_name, multiple=multiple),
     out_shape=output,
     in_specs=2 * [pl.BlockSpec(memory_space=pltpu.ANY)] + 4 * [pl.BlockSpec(memory_space=pltpu.SMEM)],
     out_specs=pl.BlockSpec(memory_space=pltpu.ANY),
