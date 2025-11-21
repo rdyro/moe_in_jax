@@ -23,12 +23,13 @@ class RDMACopy:
 
 multiple_of = lambda a, b: (a // b) * b
 
+
 def _ra2a_2d_kernel_sync(
   src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems, *, axis_name, multiple: int
 ):
   del out_ref  # aliased in dst_ref
   idx, n_devices = jax.lax.axis_index(axis_name), jax.lax.axis_size(axis_name)
-  #raise NotImplementedError("This is a 3D version, it needs to be adapted to 2D.")
+  # raise NotImplementedError("This is a 3D version, it needs to be adapted to 2D.")
 
   def make_dma(id):
     sem_id = lax.rem(idx + idx, n_devices)

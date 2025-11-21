@@ -7,6 +7,7 @@ from jax.sharding import auto_axes, PartitionSpec as P
 
 from moe.core import RA2AMeta
 
+
 def balance_indices(indices, n, multiple):
   """Minimally reassigns indices so per-device counts are divisible by `multiple`."""
   p = jnp.argsort(indices)
