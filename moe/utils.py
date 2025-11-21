@@ -53,3 +53,15 @@ def padding_to_tile(sort_idx, group_sizes, pad_size: int = 128):
   new_sort_idx = jax.lax.fori_loop(0, group_sizes.size, fn, jnp.zeros(sort_idx.shape[0] * 2, sort_idx.dtype))
   worst_case_size = sort_idx.size + group_sizes.size * (pad_size - 1)
   return new_sort_idx[:worst_case_size], padded_group_sizes
+
+
+@partial(jax.jit, static_argnames=("max_size",))
+def add_indices(idx_list: jax.Array, sizes: jax.Array, max_size: int, fill_value: int = 2 ** 31 - 1):
+  """One way to add indices from a list in desired counts, filling the rest with a fill value."""
+  start_idx = jnp.cumsum(sizes) - sizes
+  end_idx = jnp.cumsum(sizes)
+  iota = jnp.arange(idx_list.size * max_size)[None, :]
+  mask = (iota >= start_idx[:, None]) & (iota < end_idx[:, None])
+  # the result is a list having sizes[0] of idx_list[0], sizes[1] of idx_list[1] and so on
+  # the unfilled values are filled with fill_value
+  return jnp.sum(idx_list[:, None] * mask, axis=0) + ~jnp.any(mask, axis=0) * fill_value

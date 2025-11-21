@@ -15,15 +15,16 @@ from .utils import empty
 )
 @dataclasses.dataclass
 class RA2AMeta:
+  """Holds sizes and offsets for ragged all-to-all communication."""
   input_offsets: jax.Array
   send_sizes: jax.Array
   output_offsets: jax.Array
   recv_sizes: jax.Array
 
 
-def make_compute_metadata(axis_name, experts_num, safety_factor: int = 2):
+def run_moe(x: jax.Array, all_idxs: jax.Array, *, axis_name: str, experts_num: int, safety_factor: int = 2):
   @partial(jax.shard_map, out_specs=P("x", None, None), check_vma=False)
-  def compute_metadata(x: jax.Array, all_idxs: jax.Array):
+  def fn(x: jax.Array, all_idxs: jax.Array):
     shard_idx, num_shards = jax.lax.axis_index(axis_name), jax.lax.axis_size(axis_name)
     experts_per_shard = experts_num // num_shards
     experts_per_tok = all_idxs.size // x.shape[0] // num_shards  # because all_idxs is replicated
@@ -76,6 +77,7 @@ def make_compute_metadata(axis_name, experts_num, safety_factor: int = 2):
     local_group_sizes = jnp.bincount(
       jnp.where(local_pack_mask, local_expert_idxs - shard_idx * experts_per_shard, 2**30), length=experts_per_shard
     )
+    print(f"{local_group_sizes = }")
 
     # perform the actual communication and computation #################################################################
 
@@ -89,24 +91,31 @@ def make_compute_metadata(axis_name, experts_num, safety_factor: int = 2):
 
     # step 3: gather tokens locally so they're expert-contiguous
     y = y[local_sort, ...]
+    print(f"y.shape = {y.shape}")
 
     # step 4: perform gmm computation
     pass
 
     # step 5: unpermute tokens locally to organize them into chunks in which they arrived
     y = y[local_isort, ...]
+    
+    print(f"y.shape = {y.shape}")
 
     # step 6: communincate the chunks back to their origins
     # out = jnp.empty((x.shape[0] * experts_per_tok,) + x.shape[1:], dtype=x.dtype)
     out = empty((x.shape[0] * experts_per_tok,) + x.shape[1:], dtype=x.dtype)
     x_sort = jax.lax.ragged_all_to_all(y, out, *dataclasses.astuple(epilogue), axis_name=axis_name)
+    
+    print(f"x_sort.shape = {x_sort.shape}")
 
     # step 7: gather so each token repeats are next to each other
     x = x_sort[local_ra2a_isort, ...].reshape((x.shape[0], experts_per_tok) + x.shape[1:])
+    
+    print(f"x.shape = {x.shape}")
 
     # step 8: weigh by expert weights
     pass
 
     return x
 
-  return compute_metadata
+  return fn(x, all_idxs)
