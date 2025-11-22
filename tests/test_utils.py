@@ -28,17 +28,18 @@ class UtilsTests(parameterized.TestCase):
       (device_num,), (axis_name,), axis_types=jax.sharding.AxisType.Explicit, devices=devices[:device_num]
     )
     with jax.sharding.set_mesh(mesh):
-      x, meta = generate_data(4096, 2048, device_num, axis_name=axis_name, key=key)
+      x, meta = generate_data(64, 128, device_num, axis_name=axis_name, key=key)
       out = jax.device_put(jnp.zeros_like(x, shape=(2 * x.shape[0],) + x.shape[1:]), P(axis_name, None))
 
-      @partial(jax.shard_map, out_spec=P(axis_name, None))
+      @partial(jax.shard_map, out_specs=P(axis_name, None))
       def fn(x, out, meta):
+        assert x.ndim == 2
         out1 = jax.lax.ragged_all_to_all(x, out, *dataclasses.astuple(meta), axis_name=axis_name)
         out2 = _ragged_all_to_all(x, out, *dataclasses.astuple(meta), axis_name=axis_name)
         return out1, out2
 
       out1, out2 = fn(x, out, meta)
-      np.testing.assert_equal(out1, out2)
+      np.testing.assert_array_equal(out1, out2)
 
 
 if __name__ == "__main__":

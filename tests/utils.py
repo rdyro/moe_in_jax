@@ -25,7 +25,7 @@ def generate_data(n, k, device_num, *, multiple: int = 1, axis_name: str, key: i
     lambda: jnp.tile(jnp.arange(n, dtype=jnp.bfloat16)[:, None], (1, k)),
     out_sharding=P(axis_name, None)
   )()
-  key = jax.random.key(key) if not isinstance(key, type(jax.random.key(0))) else key
+  key = jax.random.key(key) if jnp.asarray(key).ndim == 0 else key
   idx = random.randint(key, shape=(n,), minval=0, maxval=device_num)
   if multiple != 1:
     idx = idx.reshape((device_num, -1))
