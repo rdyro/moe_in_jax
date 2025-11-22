@@ -1,4 +1,10 @@
 from functools import partial
+import contextlib
+import os
+import dataclasses
+import random
+from subprocess import Popen
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -7,6 +13,20 @@ import jax.experimental.pallas as pl
 
 zip_ = zip
 zip = partial(zip_, strict=True)
+
+
+@partial(
+  jax.tree_util.register_dataclass,
+  data_fields=["input_offsets", "send_sizes", "output_offsets", "recv_sizes"],
+  meta_fields=[],
+)
+@dataclasses.dataclass
+class RA2AMeta:
+  """Holds sizes and offsets for ragged all-to-all communication."""
+  input_offsets: jax.Array
+  send_sizes: jax.Array
+  output_offsets: jax.Array
+  recv_sizes: jax.Array
 
 
 def empty(shape, dtype, out_sharding=None):
@@ -106,3 +126,26 @@ def padded_gather_bwd(max_idx: int, multiple: int, res, g):
 
 
 padded_group_gather.defvjp(padded_group_gather_fwd, padded_gather_bwd)
+
+
+_tb_process, _tb_port = None, None
+
+
+@contextlib.contextmanager
+def profile(path="/tmp/profiles"):
+  global _tb_process, _tb_port
+  if _tb_process is None:
+    devnull = open(os.devnull, "w")
+    _tb_port = 52432 + random.randint(0, 1000)
+    _tb_process = Popen(["xprof", "--port", str(_tb_port), "--logdir", path], stdout=devnull, stderr=devnull)
+
+  with jax.profiler.trace("/tmp/profiles"):
+    yield
+  profiles = sorted(Path(path).absolute().glob("**/*.xplane.pb"), key=lambda x: x.stat().st_mtime)
+  profile_name = profiles[-1].parts[-2]
+  port, use_xprof = _tb_port, True
+  if use_xprof:
+    url = "http://localhost:{port}/data/plugin/profile/trace_viewer@;run={name};tag=trace_viewer@"  # xprof version
+  else:
+    url = "http://localhost:{port}/?run={name}&tag=trace_viewer"  # tensorboard version
+  print(url.format(port=port, name=profile_name))

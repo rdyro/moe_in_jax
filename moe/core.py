@@ -6,23 +6,9 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from .utils import empty, add_indices
+from .utils import RA2AMeta, empty, add_indices
 
 SENTINEL_VALUE = 2 ** 31 - 1
-
-
-@partial(
-  jax.tree_util.register_dataclass,
-  data_fields=["input_offsets", "send_sizes", "output_offsets", "recv_sizes"],
-  meta_fields=[],
-)
-@dataclasses.dataclass
-class RA2AMeta:
-  """Holds sizes and offsets for ragged all-to-all communication."""
-  input_offsets: jax.Array
-  send_sizes: jax.Array
-  output_offsets: jax.Array
-  recv_sizes: jax.Array
 
 
 def run_moe(x: jax.Array, all_idxs: jax.Array,
