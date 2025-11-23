@@ -1,15 +1,15 @@
-from functools import partial
 import contextlib
-import os
 import dataclasses
+import os
 import random
-from subprocess import Popen
+from functools import partial
 from pathlib import Path
+from subprocess import Popen
 
 import jax
+import jax.experimental.pallas as pl
 import jax.numpy as jnp
 from jax.sharding import Sharding
-import jax.experimental.pallas as pl
 
 zip_ = zip
 zip = partial(zip_, strict=True)
@@ -86,7 +86,7 @@ def add_indices(idx_list: jax.Array, sizes: jax.Array, max_size: int, fill_value
   return jnp.sum(idx_list[:, None] * mask, axis=0) + ~jnp.any(mask, axis=0) * fill_value
 
 
-def spread_arange_gather(total_length: jax.Array, counts: jax.Array, multiple: int = 4):
+def scatter_arange(total_length: jax.Array, counts: jax.Array, multiple: int = 4):
   """Creates a dilated arange corresponding to group sizes (conuts) padded to `multiple`."""
   new_counts = counts + (-counts % multiple)
   offsets = (jnp.cumsum(new_counts) - new_counts) - (jnp.cumsum(counts) - counts)
@@ -99,33 +99,65 @@ def spread_arange_gather(total_length: jax.Array, counts: jax.Array, multiple: i
   return jnp.where(some_mask, jnp.sum(full, 0), -1), some_mask
 
 
-def _padded_group_gather(x: jax.Array, idx: jax.Array, max_idx: int, multiple: int):
-  """Gather a tensor into groups according to group idx `idx`, but pad so groups are aligned to `multiple`."""
-  counts = jnp.bincount(idx, length=max_idx)
-  padding_idxs = add_indices(jnp.arange(max_idx), -counts % multiple, max_size=multiple - 1)
-  idx_with_padding = jnp.concat([idx, padding_idxs], axis=0)
-  gather_idx = jnp.argsort(idx_with_padding)
-  inv_gather_idx = jnp.argsort(gather_idx)
-  return (x[gather_idx, ...], inv_gather_idx), (idx, inv_gather_idx)
+@partial(jax.tree_util.register_dataclass, meta_fields=[], data_fields=[
+  "group_counts", "group_counts_with_padding", "group_idx", "group_idx_with_padding",
+  "sort_idx", "isort_idx", "inv_sort_idx"
+])
+@dataclasses.dataclass
+class PaddedGroupPaddedMetadata:
+  group_idx: jax.Array
+  group_idx_with_padding: jax.Array
+  group_counts: jax.Array
+  group_counts_with_padding: jax.Array
+  sort_idx: jax.Array
+  isort_idx: jax.Array
+  inv_sort_idx: jax.Array
 
 
-@partial(jax.custom_vjp, nondiff_argnames=("max_idx", "multiple"))
-def padded_group_gather(x: jax.Array, idx: jax.Array, max_idx: int, multiple: int):
-  return _padded_group_gather(x, idx, max_idx=max_idx, multiple=multiple)[0]
+def compute_padded_group_gather(group_idx: jax.Array, groups: int, multiple: int) -> PaddedGroupPaddedMetadata:
+  assert multiple >= 1
+  group_counts = jnp.bincount(group_idx, length=groups)
+
+  if multiple != 1:
+    padding_idxs = add_indices(jnp.arange(groups), -group_counts % multiple, max_size=multiple - 1)
+    group_idx_with_padding = jnp.concat([group_idx, padding_idxs], axis=0)
+    group_counts_with_padding = group_counts + (-group_counts % multiple)
+  else:
+    group_idx_with_padding, group_counts_with_padding = group_idx, group_counts
+  sort_idx = jnp.argsort(group_idx_with_padding)
+  isort_idx = jnp.argsort(sort_idx)[:group_idx.shape[0]]
+  inv_sort_idx = isort_idx[:group_idx.shape[0]]
+
+  return PaddedGroupPaddedMetadata(
+    group_idx, group_idx_with_padding, group_counts, group_counts_with_padding,
+    sort_idx, isort_idx, inv_sort_idx
+  )
 
 
-def padded_group_gather_fwd(x: jax.Array, idx: jax.Array, max_idx: int, multiple: int):
-  return _padded_group_gather(x, idx, max_idx=max_idx, multiple=multiple)
+@partial(jax.custom_vjp, nondiff_argnames=("mode",))
+def custom_gather(x: jax.Array, idx: jax.Array, inv_idx: jax.Array, mode: str):
+  assert mode in ("gather", "scatter")
+  return x[idx, ...]
 
 
-def padded_gather_bwd(max_idx: int, multiple: int, res, g):
-  del max_idx, multiple
-  g = g[0]  # the other sensitivity term belongs to the indices
-  (idx, inv_gather_idx) = res
-  return g[inv_gather_idx[jnp.argsort(idx)], ...], None
+def custom_gather_fwd(x: jax.Array, idx: jax.Array, inv_idx: jax.Array, mode: str):
+  return custom_gather(x, idx, inv_idx, mode=mode), (x.shape, inv_idx,)
 
 
-padded_group_gather.defvjp(padded_group_gather_fwd, padded_gather_bwd)
+def custom_gather_bwd(mode: str, res, g):
+  (x_shape, inv_idx,) = res
+  # if x_shape[0] <= inv_idx.size:  # gather
+  if mode == "gather":
+    grad = g[inv_idx, ...]
+  else:  # scatter
+    if g.shape[0] == x_shape[0]:  # shortcut if input/output shape matches
+      grad = g[jnp.argsort(inv_idx), ...]
+    else:
+      grad = jnp.zeros_like(g, shape=x_shape).at[inv_idx, ...].set(g, mode="drop")
+  return (grad, None, None)
+
+
+custom_gather.defvjp(custom_gather_fwd, custom_gather_bwd)
 
 
 _tb_process, _tb_port = None, None

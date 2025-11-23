@@ -38,9 +38,6 @@ def ragged_all_to_all(
     min_el_pos = jnp.min(meta_all.output_offsets[:, axis_index])
     jax.debug.callback(assert_fn, min_el_pos >= 0)
 
-  # make the buffer larger by x since we use x-sized slice in the dynamic update slice so that we don't wrap around
-  buffer_for_update_ = jnp.concatenate([out, jnp.zeros_like(out, shape=(x.shape[0],) + out.shape[1:])], 0)
-
   def insert(i, buf):
     existing_slice = jax.lax.dynamic_slice_in_dim(buf, meta_all.output_offsets[i, axis_index], x.shape[0], axis=0)
     x_ = jnp.roll(x_all[i, ...], -meta_all.input_offsets[i, axis_index], axis=0)
@@ -50,6 +47,9 @@ def ragged_all_to_all(
     buf = jax.lax.dynamic_update_slice_in_dim(buf, new_slice, meta_all.output_offsets[i, axis_index], axis=0)
     return buf
 
+  # make the buffer larger by x since we use x-sized slice in the dynamic update slice so that we don't wrap around
+  buffer_for_update_ = jnp.concatenate([out, jnp.zeros_like(out, shape=(x.shape[0],) + out.shape[1:])], 0)
   updated_buffer = jax.lax.fori_loop(0, x_all.shape[0], insert, buffer_for_update_)
   updated_buffer = updated_buffer[:out.shape[0], ...]
+
   return updated_buffer

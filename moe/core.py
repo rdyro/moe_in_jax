@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from .utils import RA2AMeta, empty, add_indices
+from .utils import RA2AMeta, add_indices, compute_padded_group_gather, custom_gather
 
 SENTINEL_VALUE = 2 ** 31 - 1
 
@@ -14,33 +14,39 @@ SENTINEL_VALUE = 2 ** 31 - 1
 def run_moe(x: jax.Array, all_idxs: jax.Array,
             compute_block: Callable[[jax.Array], jax.Array] | None = None,
             reduce_block: Callable[[jax.Array], jax.Array] | None = None,
-            *, axis_name: str, experts_num: int, safety_factor: int = 2, multiple: int = 1):
-  @partial(jax.shard_map, out_specs=P("x", None, None), check_vma=False)
+            ragged_all_to_all: Callable[[], jax.Array] = jax.lax.ragged_all_to_all,
+            *, axis_name: str, experts_num: int, safety_factor: int = 2, multiple: int = 1,
+            custom_gathers: bool = False):
+
+  out_specs = P(axis_name, *[None for _ in range(x.ndim - 1)])
+
+  @partial(jax.shard_map, out_specs=out_specs, check_vma=False)
   def fn(x: jax.Array, all_idxs: jax.Array):
     shard_idx, num_shards = jax.lax.axis_index(axis_name), jax.lax.axis_size(axis_name)
     experts_per_shard = experts_num // num_shards
     experts_per_tok = all_idxs.size // x.shape[0] // num_shards  # because all_idxs is replicated
     assert all_idxs.ndim in (1, 2), f"{jax.typeof(all_idxs)=} should be stacked (expert_shards, -1) or tiled (-1,)"
 
+    ####################################################################################################################
+    # metadata computation #############################################################################################
+    ####################################################################################################################
+
     if all_idxs.ndim == 1:
       all_idxs = all_idxs.reshape((num_shards, -1))
-    actual_tokens = all_idxs.shape[-1]
+    actual_token_num = all_idxs.shape[-1]
 
     if multiple != 1:  # padding send groups to be aligned to a multiple, this allows a sublane-aligned 2D ra2a on TPU
       fill_experts = -jax.vmap(partial(jnp.bincount, length=num_shards))(all_idxs // experts_per_shard) % multiple
       fill_indices = jax.vmap(partial(add_indices, max_size=multiple - 1, fill_value=SENTINEL_VALUE), (None, 0))(
-        jnp.arange(num_shards), fill_experts)
+        jnp.arange(num_shards), fill_experts
+      )
       fill_indices = jnp.where(fill_indices == SENTINEL_VALUE, SENTINEL_VALUE,
                                fill_indices * experts_per_shard + (experts_per_shard - 1))  # pad with the last experts
-      # with jnp.printoptions(threshold=1000, linewidth=2000):
-      #   print(fill_indices)
       all_idxs = jnp.concat([all_idxs, fill_indices], axis=1)
 
     # compute the ra2a communication ###################################################################################
 
     all_sizes = jax.vmap(partial(jnp.bincount, length=num_shards))(all_idxs // experts_per_shard)
-    # with jnp.printoptions(threshold=1000, linewidth=2000):
-    #   print(f"{all_sizes=}")
 
     all_input_offsets = jnp.cumsum(all_sizes, axis=-1) - all_sizes  # cumsum from 0
     all_output_offsets = jnp.cumsum(all_sizes, axis=0) - all_sizes  # cumsum from 0
@@ -58,70 +64,67 @@ def run_moe(x: jax.Array, all_idxs: jax.Array,
     local_ra2a_sort = jnp.argsort(all_idxs[shard_idx, :])
     local_ra2a_isort = jnp.argsort(local_ra2a_sort)
 
-    all_expert_idxs = jax.lax.all_gather(all_idxs[shard_idx, :][local_ra2a_sort], axis_name)
+    all_local_expert_idxs = jax.lax.all_gather(all_idxs[shard_idx, :][local_ra2a_sort], axis_name)
 
-    local_expert_idxs = empty((x.shape[0] * experts_per_tok * safety_factor,), jnp.int32)
+    # compute local expert idxs after the transfer
+    local_expert_idxs = jax.lax.empty(
+      (x.shape[0] * experts_per_tok * safety_factor + all_local_expert_idxs.shape[-1],), jnp.int32
+    )
 
-    def update_fn(i, local_expert_idxs):
-      update = jnp.roll(all_expert_idxs[i, :], -all_input_offsets[i, shard_idx])
+    def _update_fn(i, local_expert_idxs):
+      update = jnp.roll(all_local_expert_idxs[i, :], -all_input_offsets[i, shard_idx])
       return jax.lax.dynamic_update_slice_in_dim(local_expert_idxs, update, all_output_offsets[i, shard_idx], 0)
 
-    local_expert_idxs = jax.lax.fori_loop(0, num_shards, update_fn, local_expert_idxs)
-
-    # ra2a_sort = jnp.argsort(all_idxs, axis=-1)
-    # all_expert_idxs = jnp.take_along_axis(all_idxs, ra2a_sort, axis=-1)  # expensive
-    # all_shard_assignment = all_expert_idxs // experts_per_shard
-    # local_mask = ((all_shard_assignment >= shard_idx) & (all_shard_assignment < (shard_idx + 1))).reshape(-1)
-    # local_pack_idx = jnp.where(local_mask, size=local_mask.size, fill_value=0)  # expensive
-    # local_expert_idxs = all_expert_idxs.reshape(-1)[local_pack_idx]  # expensive
-    # local_expert_idxs = local_expert_idxs[:x.shape[0] * experts_per_tok * safety_factor]
-    # mask = jnp.arange(local_expert_idxs.size) < jnp.sum(recv_sizes)
-    # jax.debug.print("diff = {}", jnp.sum(jnp.abs(jnp.where(mask, local_expert_idxs - local_expert_idxs_, 0))))
-
+    local_expert_idxs = jax.lax.fori_loop(0, num_shards, _update_fn, local_expert_idxs)
+    local_expert_idxs = local_expert_idxs[:x.shape[0] * experts_per_tok * safety_factor]
     local_pack_mask = jnp.arange(local_expert_idxs.size) < jnp.sum(recv_sizes)
-    local_sort = jnp.argsort(jnp.where(local_pack_mask, local_expert_idxs, SENTINEL_VALUE))
-    local_isort = jnp.argsort(local_sort)
-    local_group_sizes = jnp.bincount(
-      jnp.where(local_pack_mask, local_expert_idxs - shard_idx * experts_per_shard, SENTINEL_VALUE),
-      length=experts_per_shard
-    )
-    # print(f"{local_group_sizes = }")
+    local_expert_idxs = jnp.where(local_pack_mask, local_expert_idxs, SENTINEL_VALUE)
 
-    # perform the actual communication and computation #################################################################
+    # compute the local permutation
+    local_expert_idxs_ = jnp.where(local_pack_mask, local_expert_idxs - shard_idx * experts_per_shard, SENTINEL_VALUE)
+    local_permute = compute_padded_group_gather(local_expert_idxs_, experts_per_tok, multiple=multiple)
+
+    # local_sort = jnp.argsort(local_expert_idxs)
+    # local_isort = jnp.argsort(local_sort)
+    # local_group_sizes = jnp.bincount(
+    #   jnp.where(local_pack_mask, local_expert_idxs - shard_idx * experts_per_shard, SENTINEL_VALUE),
+    #   length=experts_per_shard
+    # )
+    local_group_sizes = local_permute.group_counts_with_padding
+
+    ####################################################################################################################
+    # compute ##########################################################################################################
+    ####################################################################################################################
 
     # step 1: gather local tokens for every expert per token
     x_sort = x[local_ra2a_sort // experts_per_tok, ...]
-    # x_sort_org = x_sort
-    # x_sort2 = jnp.repeat(x, experts_per_tok, axis=0)[local_ra2a_sort, ...]
-    # print(f"err = {jnp.mean(jnp.sum(jnp.abs(x_sort - x_sort2), (-1, -2)) != 0)}")
 
     # step 2: communicate expert-gathered-tokens to their corresponding expert shards
-    # buffer = jnp.empty((x.shape[0] * experts_per_tok * safety_factor,) + x.shape[1:], dtype=x.dtype)
-    buffer = empty((x.shape[0] * experts_per_tok * safety_factor,) + x.shape[1:], dtype=x.dtype)
-    y = jax.lax.ragged_all_to_all(x_sort, buffer, *dataclasses.astuple(preamble), axis_name=axis_name)
+    buffer = jax.lax.empty((x.shape[0] * experts_per_tok * safety_factor,) + x.shape[1:], dtype=x.dtype)
+    y = ragged_all_to_all(x_sort, buffer, *dataclasses.astuple(preamble), axis_name=axis_name)
 
     # step 3: gather tokens locally so they're expert-contiguous
-    y = y[local_sort, ...]
+    if custom_gathers:
+      y = custom_gather(y, local_permute.sort_idx, local_permute.inv_sort_idx, mode="gather")
+    else:
+      y = y[local_permute.sort_idx, ...]
 
     # step 4: perform gmm computation
     if compute_block is not None:
       y = compute_block(y)
 
     # step 5: unpermute tokens locally to organize them into chunks in which they arrived
-    y = y[local_isort, ...]
+    if custom_gathers:
+      y = custom_gather(y, local_permute.isort_idx, local_permute.inv_sort_idx, mode="scatter")
+    else:
+      y = y[local_permute.isort_idx, ...]
 
     # step 6: communincate the chunks back to their origins
-    # out = jnp.empty((x.shape[0] * experts_per_tok,) + x.shape[1:], dtype=x.dtype)
-    # out = empty((x.shape[0] * experts_per_tok,) + x.shape[1:], dtype=x.dtype)
-    out = empty((all_idxs.shape[-1],) + x.shape[1:], dtype=x.dtype)
-    x_sort = jax.lax.ragged_all_to_all(y, out, *dataclasses.astuple(epilogue), axis_name=axis_name)
-    # my_total_recv = jnp.sum(epilogue.recv_sizes[shard_idx, ...])
-    # mask = jnp.arange(x_sort.shape[0])[:, None, None] < my_total_recv
-    # print(f"final err = {jnp.mean(jnp.sum(jnp.abs(x_sort_org - x_sort) * mask, (-1, -2)) != 0)}")
+    out = jax.lax.empty((all_idxs.shape[-1],) + x.shape[1:], dtype=x.dtype)
+    x_sort = ragged_all_to_all(y, out, *dataclasses.astuple(epilogue), axis_name=axis_name)
 
     # step 7: gather so each token repeats are next to each other
-    # y = x_sort[local_ra2a_isort, ...][:actual_tokens, ...].reshape((x.shape[0], experts_per_tok) + x.shape[1:])
-    y = x_sort[local_ra2a_isort[:actual_tokens], ...].reshape((x.shape[0], experts_per_tok) + x.shape[1:])
+    y = x_sort[local_ra2a_isort[:actual_token_num], ...].reshape((x.shape[0], experts_per_tok) + x.shape[1:])
 
     # step 8: weigh by expert weights
     if reduce_block is not None:
