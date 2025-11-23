@@ -78,21 +78,23 @@ class MoeTest(parameterized.TestCase):
     # check if the pad_indices actually added the desired number of pad indices to each group
     np.testing.assert_array_equal(jnp.bincount(pad_indices, length=experts), -idx_count % multiple)
 
-  @parameterized.product(experts=[32, 128], multiple=[1, 2, 4, 8])
-  def test_identity_moe_block(self, experts, multiple):
-    n_devices = jax.device_count()
+  @parameterized.product(experts_per_tok=[1, 2, 4], device=["cpu", "tpu"], multiple=[1, 2, 8])
+  def test_identity_moe_block(self, experts_per_tok, device, multiple):
+    try:
+      devices = jax.devices(device)
+    except RuntimeError:
+      self.skipTest(f"Device {device} not available")
     axis_name = "x"
-    m, k = 4096, 2048
-    mesh = jax.make_mesh((n_devices,), (axis_name,), axis_types=(jax.sharding.AxisType.Explicit,))
+    m, k, g = 4096, 128, 32
+    mesh = jax.make_mesh((len(devices),), (axis_name,), axis_types=jax.sharding.AxisType.Explicit, devices=devices)
 
     with jax.sharding.set_mesh(mesh):
-      all_idxs = jax.random.randint(jax.random.key(0), experts * m, minval=0, maxval=experts)
-      x, ra2a_meta = generate_data(m, k, device_num=n_devices, axis_name=axis_name)
+      all_idxs = jax.random.randint(jax.random.key(0), experts_per_tok * m, minval=0, maxval=g)
+      x, ra2a_meta = generate_data(m, k, device_num=len(devices), axis_name=axis_name)
       del ra2a_meta
       reduce_block = lambda x: x[:, 0, ...]
-      moe_fn = jax.jit(partial(
-          run_moe, reduce_block=reduce_block, axis_name=axis_name, experts_num=experts, multiple=multiple
-      ))
+      moe_fn = jax.jit(partial(run_moe, reduce_block=reduce_block, axis_name=axis_name, experts_num=g,
+                               multiple=multiple, ragged_all_to_all=cpu_ra2a))
       out = moe_fn(x, all_idxs)
       self.assertEqual(out.shape, (m, x.shape[-1]))
       np.testing.assert_array_equal(out, x)
