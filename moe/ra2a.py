@@ -1,13 +1,12 @@
 import dataclasses
-from typing import Callable, Any
 from functools import partial
+from typing import Any, Callable
 
 import jax
-import jax.numpy as jnp
-from jax import lax
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
-
+import jax.numpy as jnp
+from jax import lax
 
 AsyncCopyDescriptor = Any
 
@@ -24,9 +23,8 @@ class RDMACopy:
 multiple_of = lambda a, b: (a // b) * b
 
 
-def _ra2a_2d_kernel_sync(
-  src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems, *, axis_name, multiple: int
-):
+def _ra2a_2d_kernel_sync(src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems,
+                         *, axis_name: str, multiple: int):
   del out_ref  # aliased in dst_ref
   idx, n_devices = jax.lax.axis_index(axis_name), jax.lax.axis_size(axis_name)
   # raise NotImplementedError("This is a 3D version, it needs to be adapted to 2D.")
@@ -92,7 +90,7 @@ def _ra2a_3d_kernel_async(
   dst_ref,
   sems,
   *,
-  axis_name,
+  axis_name: str,
   start: bool = True,
 ):
   del out_ref  # aliased in dst_ref
@@ -140,9 +138,9 @@ def make_ra2a_3d(axis_name: str = "x"):
     n_devices = jax.lax.axis_size(axis_name)
 
     def ra2a_kernel_start(src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems):
-      kws = dict(axis_name=axis_name, start=True)
       return _ra2a_3d_kernel_async(
-        src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems, **kws
+        src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems,
+        axis_name=axis_name, start=True,
       )
 
     sems_spec = pltpu.SemaphoreType.DMA((n_devices, 2, 2))
@@ -157,13 +155,12 @@ def make_ra2a_3d(axis_name: str = "x"):
     return out, sems
 
   def wait(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, future):
-    n_devices = jax.lax.axis_size(axis_name)
     sems = future
 
     def ra2a_kernel_wait(src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, sems, dst_ref):
-      kws = dict(axis_name=axis_name, start=False)
       return _ra2a_3d_kernel_async(
-        src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems, **kws
+        src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems,
+        axis_name=axis_name, start=False
       )
 
     # sems_spec = pltpu.SemaphoreType.DMA((n_devices, 2, 2))

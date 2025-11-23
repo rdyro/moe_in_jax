@@ -87,7 +87,7 @@ def add_indices(idx_list: jax.Array, sizes: jax.Array, max_size: int, fill_value
 
 
 def scatter_arange(total_length: jax.Array, counts: jax.Array, multiple: int = 4):
-  """Creates a dilated arange corresponding to group sizes (conuts) padded to `multiple`."""
+  """Creates a dilated arange corresponding to group sizes (counts) padded to `multiple`."""
   new_counts = counts + (-counts % multiple)
   offsets = (jnp.cumsum(new_counts) - new_counts) - (jnp.cumsum(counts) - counts)
   starts = jnp.cumsum(new_counts) - new_counts
@@ -100,8 +100,7 @@ def scatter_arange(total_length: jax.Array, counts: jax.Array, multiple: int = 4
 
 
 @partial(jax.tree_util.register_dataclass, meta_fields=[], data_fields=[
-  "group_counts", "group_counts_with_padding", "group_idx", "group_idx_with_padding",
-  "sort_idx", "isort_idx", "inv_sort_idx"
+  "group_counts", "group_counts_with_padding", "group_idx", "group_idx_with_padding", "sort_idx", "isort_idx"
 ])
 @dataclasses.dataclass
 class PaddedGroupPaddedMetadata:
@@ -111,10 +110,11 @@ class PaddedGroupPaddedMetadata:
   group_counts_with_padding: jax.Array
   sort_idx: jax.Array
   isort_idx: jax.Array
-  inv_sort_idx: jax.Array
 
 
 def compute_padded_group_gather(group_idx: jax.Array, groups: int, multiple: int) -> PaddedGroupPaddedMetadata:
+  """Compute metadata for sorting tokens according to group_idx with padding to make groups divisible by `multiple`."""
+
   assert multiple >= 1
   group_counts = jnp.bincount(group_idx, length=groups)
 
@@ -126,38 +126,40 @@ def compute_padded_group_gather(group_idx: jax.Array, groups: int, multiple: int
     group_idx_with_padding, group_counts_with_padding = group_idx, group_counts
   sort_idx = jnp.argsort(group_idx_with_padding)
   isort_idx = jnp.argsort(sort_idx)[:group_idx.shape[0]]
-  inv_sort_idx = isort_idx[:group_idx.shape[0]]
 
   return PaddedGroupPaddedMetadata(
-    group_idx, group_idx_with_padding, group_counts, group_counts_with_padding,
-    sort_idx, isort_idx, inv_sort_idx
+    group_idx, group_idx_with_padding, group_counts, group_counts_with_padding, sort_idx, isort_idx
   )
 
 
-@partial(jax.custom_vjp, nondiff_argnames=("mode",))
-def custom_gather(x: jax.Array, idx: jax.Array, inv_idx: jax.Array, mode: str):
+@partial(jax.custom_vjp, nondiff_argnames=("mode", "empty_buffer_for_scatter"))
+def unique_gather(x: jax.Array, idx: jax.Array, inv_idx: jax.Array, mode: str, empty_buffer_for_scatter: bool = True):
+  """Gather (unique indices): Backwards pass is gather/scatter, avoiding costly scatter-add."""
   assert mode in ("gather", "scatter")
   return x[idx, ...]
 
 
-def custom_gather_fwd(x: jax.Array, idx: jax.Array, inv_idx: jax.Array, mode: str):
-  return custom_gather(x, idx, inv_idx, mode=mode), (x.shape, inv_idx,)
+def unique_gather_fwd(x: jax.Array, idx: jax.Array, inv_idx: jax.Array, mode: str, empty_buffer_for_scatter: bool):
+  print(f"{empty_buffer_for_scatter=}, {mode=}")
+  static = dict(mode=mode, empty_buffer_for_scatter=empty_buffer_for_scatter)
+  return unique_gather(x, idx, inv_idx, **static), (x.shape, inv_idx,)
 
 
-def custom_gather_bwd(mode: str, res, g):
+def unique_gather_bwd(mode: str, empty_buffer_for_scatter: bool, res, g):
   (x_shape, inv_idx,) = res
-  # if x_shape[0] <= inv_idx.size:  # gather
   if mode == "gather":
     grad = g[inv_idx, ...]
   else:  # scatter
+    # TODO(rdyro): check if this gather optimization actually outperforms scatter
     if g.shape[0] == x_shape[0]:  # shortcut if input/output shape matches
       grad = g[jnp.argsort(inv_idx), ...]
-    else:
-      grad = jnp.zeros_like(g, shape=x_shape).at[inv_idx, ...].set(g, mode="drop")
+    else:  # otherwise really use scatter
+      buf = jax.lax.empty(x_shape, dtype=g.dtype) if empty_buffer_for_scatter else jnp.zeros(x_shape, dtype=g.dtype)
+      grad = buf.at[inv_idx, ...].set(g, mode="drop")
   return (grad, None, None)
 
 
-custom_gather.defvjp(custom_gather_fwd, custom_gather_bwd)
+unique_gather.defvjp(unique_gather_fwd, unique_gather_bwd)
 
 
 _tb_process, _tb_port = None, None

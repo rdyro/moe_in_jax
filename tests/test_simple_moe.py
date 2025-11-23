@@ -19,7 +19,7 @@ except RuntimeError:
 
 class MoeTest(parameterized.TestCase):
   @parameterized.product(experts_per_tok=[1, 2, 4], device=["cpu", "tpu"], multiple=[1, 2, 8])
-  def test_custom_gather_derivative(self, experts_per_tok, device, multiple):
+  def test_unique_gather_derivative(self, experts_per_tok, device, multiple):
     try:
       devices = jax.devices(device)
     except RuntimeError:

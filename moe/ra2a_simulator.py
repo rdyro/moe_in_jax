@@ -1,5 +1,4 @@
-"""Simple all-gather simulator for ragged_all_to_all with extensive debug callbacks."""
-
+"""Simple all-gather simulator for ragged_all_to_all with optional runtime checks via jax.debug."""
 
 import jax
 import jax.numpy as jnp

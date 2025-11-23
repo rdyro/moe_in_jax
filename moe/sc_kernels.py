@@ -1,5 +1,6 @@
 import math
 from functools import partial
+from typing import Literal
 
 import jax
 import jax.experimental.pallas as pl
@@ -44,6 +45,7 @@ def gather_3d_to_2d(x, idx):
   in_specs = [pl.BlockSpec(memory_space=pltpu.HBM), pl.BlockSpec((rows,), lambda i: (i,))]
   out_specs = pl.BlockSpec((rows, out_shape.shape[1]), lambda i: (i, 0))
   grid = (pl.cdiv(x.shape[0], rows),)
+  dimension_semantics: list[Literal["arbitrary", "parallel"]] = ["arbitrary"]
   return pl.pallas_call(
     kernel,
     out_shape=out_shape,
@@ -51,6 +53,6 @@ def gather_3d_to_2d(x, idx):
     out_specs=out_specs,
     grid=grid,
     compiler_params=pltpu.CompilerParams(
-      dimension_semantics=["arbitrary"], kernel_type=pltpu.KernelType.SC_VECTOR_SUBCORE
+      dimension_semantics=dimension_semantics, kernel_type=pltpu.KernelType.SC_VECTOR_SUBCORE
     ),
   )(x, idx)
