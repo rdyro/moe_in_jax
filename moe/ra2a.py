@@ -23,9 +23,11 @@ class RDMACopy:
 multiple_of = lambda a, b: (a // b) * b
 
 
-def _ra2a_2d_kernel_sync(src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems,
+def _ra2a_2d_kernel_sync(src_ref,
+                         # out_ref,
+                         input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems,
                          *, axis_name: str, multiple: int):
-  del out_ref  # aliased in dst_ref
+  # del out_ref  # aliased in dst_ref
   idx, n_devices = jax.lax.axis_index(axis_name), jax.lax.axis_size(axis_name)
   # raise NotImplementedError("This is a 3D version, it needs to be adapted to 2D.")
 
@@ -65,16 +67,47 @@ def _ra2a_2d_kernel_sync(src_ref, out_ref, input_offsets, send_sizes, output_off
 @partial(jax.jit, static_argnames=("axis_name", "multiple"))
 def ra2a_2d(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, *, axis_name: str = "x", multiple: int):
   n_devices = jax.lax.axis_size(axis_name)
+  # del output
   out = pl.pallas_call(
     partial(_ra2a_2d_kernel_sync, axis_name=axis_name, multiple=multiple),
-    out_shape=output,
-    in_specs=2 * [pl.BlockSpec(memory_space=pltpu.ANY)] + 4 * [pl.BlockSpec(memory_space=pltpu.SMEM)],
+    out_shape=jax.ShapeDtypeStruct(output.shape, output.dtype),
+    # in_specs=2 * [pl.BlockSpec(memory_space=pltpu.ANY)] + 4 * [pl.BlockSpec(memory_space=pltpu.SMEM)],
+    in_specs=1 * [pl.BlockSpec(memory_space=pltpu.ANY)] + 4 * [pl.BlockSpec(memory_space=pltpu.SMEM)],
     out_specs=pl.BlockSpec(memory_space=pltpu.ANY),
     scratch_shapes=[pltpu.SemaphoreType.DMA((n_devices, 2, 2))],
-    input_output_aliases={1: 0},
+    # input_output_aliases={1: 0},
     interpret=False,
-  )(src, output, input_offsets, send_sizes, output_offsets, recv_sizes)
+  )(src,
+    # output,
+    input_offsets, send_sizes, output_offsets, recv_sizes)
   return out
+
+
+@partial(jax.custom_vjp, nondiff_argnames=("axis_name", "multiple"))
+def ra2a(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, axis_name: str, multiple: int):
+  return ra2a_2d(src, output, input_offsets, send_sizes, output_offsets, recv_sizes,
+                 axis_name=axis_name, multiple=multiple)
+
+
+def ra2a_fwd(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, axis_name: str, multiple: int):
+  out = ra2a_2d(src, output, input_offsets, send_sizes, output_offsets, recv_sizes,
+                axis_name=axis_name, multiple=multiple)
+  res = (input_offsets, send_sizes, output_offsets, recv_sizes, src.shape)
+  return out, res
+
+
+def ra2a_bwd(axis_name: str, multiple: int, res, g):
+  (input_offsets, send_sizes, output_offsets, recv_sizes, src_shape) = res
+  buf = jax.lax.empty(src_shape, dtype=g.dtype)
+  inv_send_sizes, inv_recv_sizes = recv_sizes, send_sizes
+  inv_input_offsets = jax.lax.all_to_all(output_offsets, axis_name, split_axis=0, concat_axis=0)
+  inv_output_offsets = jax.lax.all_to_all(input_offsets, axis_name, split_axis=0, concat_axis=0)
+  dsrc = ra2a_2d(g, buf, inv_input_offsets, inv_send_sizes, inv_output_offsets, inv_recv_sizes,
+                 axis_name=axis_name, multiple=multiple)
+  return (dsrc, *[None for _ in range(1 + 4)])
+
+
+ra2a.defvjp(ra2a_fwd, ra2a_bwd)
 
 
 # asynchronous ra2a 3D kernel ##########################################################################################

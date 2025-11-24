@@ -112,11 +112,13 @@ class PaddedGroupPaddedMetadata:
   isort_idx: jax.Array
 
 
-def compute_padded_group_gather(group_idx: jax.Array, groups: int, multiple: int) -> PaddedGroupPaddedMetadata:
+def compute_padded_group_gather(group_idx: jax.Array, groups: int, multiple: int,
+                                group_counts: jax.Array | None = None) -> PaddedGroupPaddedMetadata:
   """Compute metadata for sorting tokens according to group_idx with padding to make groups divisible by `multiple`."""
 
   assert multiple >= 1
-  group_counts = jnp.bincount(group_idx, length=groups)
+  if group_counts is None:
+    group_counts = jnp.bincount(group_idx, length=groups)
 
   if multiple != 1:
     padding_idxs = add_indices(jnp.arange(groups), -group_counts % multiple, max_size=multiple - 1)
@@ -140,7 +142,6 @@ def unique_gather(x: jax.Array, idx: jax.Array, inv_idx: jax.Array, mode: str, e
 
 
 def unique_gather_fwd(x: jax.Array, idx: jax.Array, inv_idx: jax.Array, mode: str, empty_buffer_for_scatter: bool):
-  print(f"{empty_buffer_for_scatter=}, {mode=}")
   static = dict(mode=mode, empty_buffer_for_scatter=empty_buffer_for_scatter)
   return unique_gather(x, idx, inv_idx, **static), (x.shape, inv_idx,)
 

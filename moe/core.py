@@ -42,21 +42,27 @@ def run_moe(x: jax.Array, all_idxs: jax.Array,
       if all_idxs.ndim == 1:
         all_idxs = all_idxs.reshape((num_shards, -1))
       actual_token_num = all_idxs.shape[-1]
-      batch_bincount_fn = jax.vmap(partial(jnp.bincount, length=num_shards))
+
+      all_sizes = jnp.bincount(all_idxs[shard_idx, :], length=experts_num)
+      all_sizes = jax.lax.all_gather(all_sizes, axis_name, axis=0, tiled=False)
+      all_shard_sizes = jnp.sum(all_sizes.reshape((num_shards, num_shards, experts_per_shard)), axis=-1)
 
       if multiple != 1:  # padding send groups to be aligned to a multiple, this allows a sublane-aligned 2D ra2a on TPU
-        fill_experts = -batch_bincount_fn(all_idxs // experts_per_shard) % multiple
+        fill_experts = -all_shard_sizes % multiple
         add_indices_fn = jax.vmap(partial(add_indices, max_size=multiple - 1, fill_value=SENTINEL_VALUE), (None, 0))
         last_expert_per_shard = jnp.arange(num_shards) * experts_per_shard + (experts_per_shard - 1)
         fill_indices = add_indices_fn(last_expert_per_shard, fill_experts)
         all_idxs = jnp.concat([all_idxs, fill_indices], axis=1)
+        all_shard_sizes = all_shard_sizes + fill_experts
+        all_sizes = all_sizes.reshape((num_shards, num_shards, experts_per_shard)).at[..., -1].add(
+            fill_experts).reshape(all_sizes.shape)
 
       # compute the ra2a communication #################################################################################
 
-      all_sizes = batch_bincount_fn(all_idxs // experts_per_shard)  # after padding
-      all_input_offsets = jnp.cumsum(all_sizes, axis=-1) - all_sizes  # cumsum from 0
-      all_output_offsets = jnp.cumsum(all_sizes, axis=0) - all_sizes  # cumsum from 0
-      send_sizes, recv_sizes = all_sizes[shard_idx, :], all_sizes[:, shard_idx]
+      # all_sizes = batch_bincount_fn(all_idxs // experts_per_shard)  # after padding
+      all_input_offsets = jnp.cumsum(all_shard_sizes, axis=-1) - all_shard_sizes  # cumsum from 0
+      all_output_offsets = jnp.cumsum(all_shard_sizes, axis=0) - all_shard_sizes  # cumsum from 0
+      send_sizes, recv_sizes = all_shard_sizes[shard_idx, :], all_shard_sizes[:, shard_idx]
       input_offsets, output_offsets = all_input_offsets[shard_idx, :], all_output_offsets[shard_idx, :]
       preamble = RA2AMeta(input_offsets, send_sizes, output_offsets, recv_sizes)
       inv_input_offsets = all_output_offsets[:, shard_idx]  # we send back chunks starting where we received them
@@ -72,7 +78,7 @@ def run_moe(x: jax.Array, all_idxs: jax.Array,
 
       all_local_expert_idxs = jax.lax.all_gather(all_idxs[shard_idx, :][local_ra2a_sort], axis_name)
 
-      # compute local expert idxs after the transfer
+      # compute local expert idxs after the transfer (technically a ra2a, but more efficient via AG and dynamic slice)
       def _update_fn(i, local_expert_idxs):
         update = jnp.roll(all_local_expert_idxs[i, :], -all_input_offsets[i, shard_idx])
         return jax.lax.dynamic_update_slice_in_dim(local_expert_idxs, update, all_output_offsets[i, shard_idx], 0)
@@ -85,7 +91,13 @@ def run_moe(x: jax.Array, all_idxs: jax.Array,
 
       # compute the local permutation
       local_expert_idxs_ = jnp.where(local_pack_mask, local_expert_idxs - shard_idx * experts_per_shard, SENTINEL_VALUE)
-      local_permute = compute_padded_group_gather(local_expert_idxs_, experts_per_tok, multiple=multiple)
+      local_group_counts = jnp.sum(all_sizes.reshape((num_shards, num_shards, experts_per_shard))[:, shard_idx, :], 0)
+      # local_group_counts = jnp.sum(
+      #   jax.lax.dynamic_slice_in_dim(all_sizes, experts_per_shard * shard_idx, experts_per_shard, axis=-1), 0
+      # )
+      # local_group_counts = jnp.bincount(local_expert_idxs_, length=experts_per_shard)
+      local_permute = compute_padded_group_gather(local_expert_idxs_, experts_per_shard, multiple=multiple,
+                                                  group_counts=local_group_counts)
 
       # local_sort = jnp.argsort(local_expert_idxs)
       # local_isort = jnp.argsort(local_sort)
@@ -93,7 +105,7 @@ def run_moe(x: jax.Array, all_idxs: jax.Array,
       #   jnp.where(local_pack_mask, local_expert_idxs - shard_idx * experts_per_shard, SENTINEL_VALUE),
       #   length=experts_per_shard
       # )
-      local_group_sizes = local_permute.group_counts_with_padding
+      local_group_counts = local_permute.group_counts_with_padding
 
     ####################################################################################################################
     # compute ##########################################################################################################

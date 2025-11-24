@@ -16,6 +16,11 @@ try:
 except RuntimeError:
   pass
 
+random_normal = lambda key, shape, dtype: jnp.array(np.random.default_rng(key).normal(size=shape)).astype(dtype)
+random_randint = lambda key, shape, minval, maxval: jnp.array(np.random.default_rng(key).integers(
+    minval, maxval, size=shape
+)).astype(jnp.int32)
+
 
 class MoeTest(parameterized.TestCase):
   @parameterized.product(experts_per_tok=[1, 2, 4], device=["cpu", "tpu"], multiple=[1, 2, 8])
@@ -31,10 +36,12 @@ class MoeTest(parameterized.TestCase):
       n, k, g = 256, 128, 32
       x = jax.random.normal(jax.random.key(0), (n, k), dtype="bfloat16")
       all_idxs = jax.random.randint(jax.random.key(0), (experts_per_tok * x.shape[0],), minval=0, maxval=g)
+      # x = random_normal(0, (n, k), dtype="bfloat16")
+      # all_idxs = random_randint(0, (experts_per_tok * x.shape[0],), minval=0, maxval=g)
       x, all_idxs = jax.device_put(x, P(axis_name, None)), jax.device_put(all_idxs, P(None))
       opts = dict(axis_name="x", experts_num=g, ragged_all_to_all=cpu_ra2a, multiple=multiple)
-      moe1_fn = partial(run_moe, **opts, custom_gathers=False)
-      moe2_fn = partial(run_moe, **opts, custom_gathers=True)
+      moe1_fn = jax.jit(partial(run_moe, **opts, custom_gathers=False))
+      moe2_fn = jax.jit(partial(run_moe, **opts, custom_gathers=True))
       o1, vjp1_fn = jax.vjp(partial(moe1_fn, all_idxs=all_idxs), x)
       o2, vjp2_fn = jax.vjp(partial(moe2_fn, all_idxs=all_idxs), x)
 
