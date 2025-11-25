@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from .utils import RA2AMeta, add_indices, compute_padded_group_gather
+from .utils import RA2AMeta, add_indices, compute_padded_group_gather, unique_gather
 
 
 class RaggedAllToCallCallable(Protocol):
@@ -16,15 +16,6 @@ class RaggedAllToCallCallable(Protocol):
 
 
 SENTINEL_VALUE = 2 ** 31 - 1
-
-
-def _get_gather_dims(x):
-  return dict(
-      dimension_numbers=jax.lax.GatherDimensionNumbers(
-          offset_dims=tuple(range(1, x.ndim)), collapsed_slice_dims=(0,), start_index_map=(0,)
-      ),
-      slice_sizes=(1, *x.shape[1:])
-  )
 
 
 def run_moe(x: jax.Array, all_idxs: jax.Array,
@@ -134,8 +125,8 @@ def run_moe(x: jax.Array, all_idxs: jax.Array,
     # step 3: gather tokens locally so they're expert-contiguous
     with jax.named_scope("local_gather_before"):
       if custom_gathers:
-        # y = unique_gather(y, local_permute.sort_idx, local_permute.isort_idx, mode="gather")
-        y = jax.lax.gather(y, local_permute.sort_idx[:, None], **_get_gather_dims(y), unique_indices=True)
+        y = unique_gather(y, local_permute.sort_idx, local_permute.isort_idx, ad_mode="gather")
+        # y = y.at[local_permute.sort_idx, ...].get(unique_indices=True)
       else:
         y = y[local_permute.sort_idx, ...]
 
@@ -147,8 +138,8 @@ def run_moe(x: jax.Array, all_idxs: jax.Array,
     # step 5: unpermute tokens locally to organize them into chunks in which they arrived
     with jax.named_scope("local_gather_after"):
       if custom_gathers:
-        # y = unique_gather(y, local_permute.isort_idx, local_permute.isort_idx, mode="scatter")
-        y = jax.lax.gather(y, local_permute.isort_idx[:, None], **_get_gather_dims(y), unique_indices=True)
+        y = unique_gather(y, local_permute.isort_idx, local_permute.isort_idx, ad_mode="scatter")
+        # y = y.at[local_permute.isort_idx, ...].get(unique_indices=True)
       else:
         y = y[local_permute.isort_idx, ...]
 
@@ -160,8 +151,8 @@ def run_moe(x: jax.Array, all_idxs: jax.Array,
     # step 7: gather so each token repeats are next to each other
     with jax.named_scope("expert_to_tokens_gather"):
       if custom_gathers:
-        # y = unique_gather(x_sort, local_ra2a_isort, local_ra2a_isort, mode="scatter")
-        y = jax.lax.gather(x_sort, local_ra2a_isort[:, None], **_get_gather_dims(x_sort), unique_indices=True)
+        y = unique_gather(x_sort, local_ra2a_isort, local_ra2a_isort, ad_mode="scatter")
+        # y = x_sort.at[local_ra2a_isort, ...].get(unique_indices=True)
       else:
         y = x_sort[local_ra2a_isort, ...]
       y = y.reshape((x.shape[0], experts_per_tok) + x.shape[1:])

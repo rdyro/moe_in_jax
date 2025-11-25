@@ -2,7 +2,13 @@ import os
 import time
 from functools import partial
 
-os.environ["XLA_FLAGS"] = "--xla_gpu_enable_command_buffer=''"  # let named_scopes show up on GPU
+os.environ["LIBTPU_INIT_ARGS"] = " ".join([
+  "--xla_tpu_enable_offloading_gather_to_sparsecore=true",
+  "--xla_tpu_enable_offloading_scatter_to_sparsecore=true",
+  "--xla_tpu_offload_all_supported_gathers_to_sparsecore=true",
+  "--xla_tpu_offload_gather_to_sparsecore=true",
+])
+# os.environ["XLA_FLAGS"] = "--xla_gpu_enable_command_buffer=''"  # let named_scopes show up on GPU
 
 import jax
 import jax.numpy as jnp
@@ -19,19 +25,26 @@ except RuntimeError:
 def main():
   axis_name = "x"
   g = 128
-  m = 4096
+  m = 4096 * 8
   experts_per_tok = 8
-  embed = 7168
-  multiple = 8
+
+  embed = 7168 // 8
+  # embed = 7168
+
+  x_shape = (m, 8, embed)
+  # x_shape = (m, embed)
+
+  # multiple = 8
+  multiple = 1
 
   keys = iter(jax.random.split(jax.random.key(0), 1024))
 
   x: jax.Array
-  x = jax.jit(lambda key: jax.random.normal(key, (m, embed), dtype="bfloat16"),
+  x = jax.jit(lambda key: jax.random.normal(key, x_shape, dtype="bfloat16"),
               out_shardings=P(axis_name, None))(next(keys))
   all_idxs = jax.jit(lambda key: jax.random.randint(key, (experts_per_tok * x.shape[0],), minval=0, maxval=g),
                      out_shardings=P(None))(next(keys))
-  r = jax.jit(lambda key: jax.random.normal(key, (x.shape[0], experts_per_tok, x.shape[1]), dtype=x.dtype),
+  r = jax.jit(lambda key: jax.random.normal(key, (x.shape[0], experts_per_tok, *x.shape[1:]), dtype=x.dtype),
               out_shardings=x.sharding)(next(keys))
 
   def compute(y, group_sizes):
@@ -42,11 +55,11 @@ def main():
     assert (g // len(devices)) == group_sizes.size
     group_idxs = group_sizes.size * shard_idx + jnp.arange(group_sizes.size)
     weights = jnp.sum(((iota >= starts[None, :]) & (iota < ends[None, :])) * group_idxs[None, :], -1)
-    return y * weights[:, None]
+    return y * jnp.expand_dims(weights, tuple(range(1, x.ndim)))
 
   # ra2a_fn = partial(moe.ra2a.ra2a, multiple=multiple)
-  # ra2a_fn = jax.lax.ragged_all_to_all
-  ra2a_fn = moe.ra2a_simulator.ragged_all_to_all
+  ra2a_fn = jax.lax.ragged_all_to_all
+  # ra2a_fn = moe.ra2a_simulator.ragged_all_to_all
   opts = dict(axis_name="x", experts_num=g, multiple=multiple, ragged_all_to_all=ra2a_fn, compute_block=compute)
 
   run_moe = partial(moe.core.run_moe, **opts)

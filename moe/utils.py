@@ -11,6 +11,7 @@ import jax.experimental.pallas as pl
 import jax.numpy as jnp
 from jax.sharding import Sharding
 
+
 zip_ = zip
 zip = partial(zip_, strict=True)
 
@@ -134,28 +135,28 @@ def compute_padded_group_gather(group_idx: jax.Array, groups: int, multiple: int
   )
 
 
-@partial(jax.custom_vjp, nondiff_argnames=("mode", "empty_buffer_for_scatter"))
-def unique_gather(x: jax.Array, idx: jax.Array, inv_idx: jax.Array, mode: str, empty_buffer_for_scatter: bool = True):
+@partial(jax.custom_vjp, nondiff_argnames=("ad_mode", "empty_for_scatter"))
+def unique_gather(x: jax.Array, idx: jax.Array, inv_idx: jax.Array, ad_mode: str, empty_for_scatter: bool = True):
   """Gather (unique indices): Backwards pass is gather/scatter, avoiding costly scatter-add."""
-  assert mode in ("gather", "scatter")
+  assert ad_mode in ("gather", "scatter")
   return x[idx, ...]
 
 
-def unique_gather_fwd(x: jax.Array, idx: jax.Array, inv_idx: jax.Array, mode: str, empty_buffer_for_scatter: bool):
-  static = dict(mode=mode, empty_buffer_for_scatter=empty_buffer_for_scatter)
+def unique_gather_fwd(x: jax.Array, idx: jax.Array, inv_idx: jax.Array, ad_mode: str, empty_for_scatter: bool):
+  static = dict(ad_mode=ad_mode, empty_for_scatter=empty_for_scatter)
   return unique_gather(x, idx, inv_idx, **static), (x.shape, inv_idx,)
 
 
-def unique_gather_bwd(mode: str, empty_buffer_for_scatter: bool, res, g):
+def unique_gather_bwd(ad_mode: str, empty_for_scatter: bool, res, g):
   (x_shape, inv_idx,) = res
-  if mode == "gather":
+  if ad_mode == "gather":
     grad = g[inv_idx, ...]
   else:  # scatter
     # TODO(rdyro): check if this gather optimization actually outperforms scatter
     if g.shape[0] == x_shape[0]:  # shortcut if input/output shape matches
       grad = g[jnp.argsort(inv_idx), ...]
     else:  # otherwise really use scatter
-      buf = jax.lax.empty(x_shape, dtype=g.dtype) if empty_buffer_for_scatter else jnp.zeros(x_shape, dtype=g.dtype)
+      buf = jax.lax.empty(x_shape, dtype=g.dtype) if empty_for_scatter else jnp.zeros(x_shape, dtype=g.dtype)
       grad = buf.at[inv_idx, ...].set(g, mode="drop")
   return (grad, None, None)
 
