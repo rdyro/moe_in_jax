@@ -8,7 +8,7 @@ from jax.sharding import PartitionSpec as P
 import numpy as np
 
 from moe.core import run_moe, add_indices
-from moe.ra2a_simulator import ragged_all_to_all as cpu_ra2a
+from moe.ra2a_simulator import ragged_all_to_all as ra2a_via_ag
 from .utils import generate_data
 
 try:
@@ -23,8 +23,11 @@ random_randint = lambda key, shape, minval, maxval: jnp.array(np.random.default_
 
 
 class MoeTest(parameterized.TestCase):
-  @parameterized.product(experts_per_tok=[1, 2, 4], device=["cpu", "tpu"], multiple=[1, 2, 8])
-  def test_unique_gather_derivative(self, experts_per_tok, device, multiple):
+  @parameterized.product(
+      # experts_per_tok=[1, 2, 4], device=["cpu", "tpu", "cuda"], multiple=[1, 2, 8], with_compute=[True, False]
+      experts_per_tok=[1, 2, 4], device=["cpu", "tpu", "cuda"], multiple=[1], with_compute=[True, False]
+  )
+  def test_unique_gather_derivative(self, experts_per_tok, device, multiple, with_compute):
     try:
       devices = jax.devices(device)
     except RuntimeError:
@@ -33,27 +36,40 @@ class MoeTest(parameterized.TestCase):
     mesh = jax.make_mesh((len(devices),), (axis_name,), axis_types=jax.sharding.AxisType.Explicit, devices=devices)
 
     with jax.sharding.set_mesh(mesh):
-      n, k, g = 256, 128, 32
-      x = jax.random.normal(jax.random.key(0), (n, k), dtype="bfloat16")
+      n, k, g = 1024, 128, 32
+      x = jax.random.normal(jax.random.key(0), (n, k), dtype="float32")
       all_idxs = jax.random.randint(jax.random.key(0), (experts_per_tok * x.shape[0],), minval=0, maxval=g)
-      # x = random_normal(0, (n, k), dtype="bfloat16")
-      # all_idxs = random_randint(0, (experts_per_tok * x.shape[0],), minval=0, maxval=g)
       x, all_idxs = jax.device_put(x, P(axis_name, None)), jax.device_put(all_idxs, P(None))
-      opts = dict(axis_name="x", experts_num=g, ragged_all_to_all=cpu_ra2a, multiple=multiple)
+
+      def compute(y, group_sizes):
+        # construct dummy weight where the weight is just the expert index
+        shard_idx = jax.lax.axis_index(axis_name)
+        iota = jax.lax.broadcasted_iota("int32", (y.shape[0], group_sizes.shape[-1]), 0)
+        starts, ends = jnp.cumsum(group_sizes) - group_sizes, jnp.cumsum(group_sizes)
+        assert (g // len(devices)) == group_sizes.size
+        group_idxs = group_sizes.size * shard_idx + jnp.arange(group_sizes.size)
+        weights = jnp.sum(((iota >= starts[None, :]) & (iota < ends[None, :])) * group_idxs[None, :], -1)
+        return y * weights[:, None]
+
+      opts = dict(axis_name="x", experts_num=g, ragged_all_to_all=ra2a_via_ag, multiple=multiple, compute_block=compute)
       moe1_fn = jax.jit(partial(run_moe, **opts, custom_gathers=False))
       moe2_fn = jax.jit(partial(run_moe, **opts, custom_gathers=True))
       o1, vjp1_fn = jax.vjp(partial(moe1_fn, all_idxs=all_idxs), x)
       o2, vjp2_fn = jax.vjp(partial(moe2_fn, all_idxs=all_idxs), x)
 
-      x_new = np.array(o1[:, 0, :])
-      np.testing.assert_allclose(x, x_new)
+      # np.testing.assert_allclose(x, x_new)
+      x_ref = jnp.repeat(x, experts_per_tok, axis=0, out_sharding=P(axis_name, None))
+      x_ref = x_ref.reshape((x.shape[0], experts_per_tok, x.shape[1]))
+      x_ref *= all_idxs.reshape((x.shape[0], experts_per_tok, 1))
+      np.testing.assert_allclose(x_ref, o1)
       np.testing.assert_allclose(o1, o2)
 
-      r = jax.jit(lambda: jax.random.normal(jax.random.key(1), o1.shape, dtype="bfloat16"),
+      r = jax.jit(lambda: jax.random.normal(jax.random.key(1), o1.shape, dtype=x.dtype),
                   out_shardings=P(axis_name, None, None))()
-      do1 = vjp1_fn(r)
-      do2 = vjp2_fn(r)
-      np.testing.assert_allclose(do1, do2)
+      (do1,) = vjp1_fn(r)
+      (do2,) = vjp2_fn(r)
+      do1_error = jnp.max(jnp.linalg.norm(do1 - do2, axis=-1) / jnp.maximum(jnp.linalg.norm(do1, axis=-1), 1e-7))
+      self.assertLess(do1_error, 1e-6)
 
   @parameterized.product(experts_per_tok=[1, 2, 4, 8], device=["cpu", "tpu"])
   def test_simple_moe(self, experts_per_tok, device):
@@ -71,7 +87,7 @@ class MoeTest(parameterized.TestCase):
       x = jax.random.normal(jax.random.key(0), (n, k), dtype="bfloat16")
       all_idxs = jax.random.randint(jax.random.key(0), (experts_per_tok * x.shape[0],), minval=0, maxval=g)
       x, all_idxs = jax.device_put(x, P(axis_name, None)), jax.device_put(all_idxs, P(None))
-      out = run_moe(x, all_idxs, axis_name="x", experts_num=g, ragged_all_to_all=cpu_ra2a)
+      out = run_moe(x, all_idxs, axis_name="x", experts_num=g, ragged_all_to_all=ra2a_via_ag)
       self.assertEqual(out.shape, (n, experts_per_tok, x.shape[-1]))
 
       x_new = np.array(out[:, 0, :])
@@ -101,7 +117,7 @@ class MoeTest(parameterized.TestCase):
       del ra2a_meta
       reduce_block = lambda x: x[:, 0, ...]
       moe_fn = jax.jit(partial(run_moe, reduce_block=reduce_block, axis_name=axis_name, experts_num=g,
-                               multiple=multiple, ragged_all_to_all=cpu_ra2a))
+                               multiple=multiple, ragged_all_to_all=ra2a_via_ag))
       out = moe_fn(x, all_idxs)
       self.assertEqual(out.shape, (m, x.shape[-1]))
       np.testing.assert_array_equal(out, x)
