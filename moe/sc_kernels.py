@@ -16,18 +16,15 @@ import jax.experimental.pallas.tpu_sc as plsc  # noqa: E402
 from jax.experimental.compute_on import compute_on  # noqa: E402
 
 
-def sc_gather(x, idx, window):
+def sc_gather(x, idx, window: int | None = None):
   tpu_info = pltpu.get_tpu_info().sparse_core
-  # num_cores, num_subcores, window = tpu_info.num_cores, tpu_info.num_subcores, tpu_info.num_lanes
   num_cores, num_subcores = tpu_info.num_cores, tpu_info.num_subcores
-  num_cores = 2
+  window = tpu_info.num_lanes if window is None else window
   out_shape = jax.ShapeDtypeStruct((idx.shape[0], *x.shape[1:]), x.dtype)
-  # out = 17 * jnp.ones(out_shape.shape, out_shape.dtype)
   out = jax.lax.empty(out_shape.shape, out_shape.dtype)
   x_ref, idx_ref, o_ref = jax.tree.map(jax.new_ref, (x, idx, out))
 
   @pl.kernel(
-      # out_shape=out_shape,
       out_shape=(),
       mesh=plsc.VectorSubcoreMesh(
             core_axis_name="core", subcore_axis_name="subcore", num_cores=num_cores
@@ -36,195 +33,112 @@ def sc_gather(x, idx, window):
           pltpu.VMEM((window,), jnp.int32),
           pltpu.VMEM((window, *x.shape[1:]), x.dtype),
           pltpu.VMEM((window, *x.shape[1:]), x.dtype),
-      #    pltpu.VMEM((window, x.shape[1] * LANES), dtype),
+          pltpu.SemaphoreType.DMA((4,)),
       ),
   )
-  def gather(idx_vmem, x_scratch_ref, scratch_2):  # , o_scratch_ref):
-    core_id = jax.lax.axis_index("core")
-    subcore_id = jax.lax.axis_index("subcore")
-    # @pl.when((subcore_id == 0) & (core_id == 0))
-    # def _():
+  def _gather(idx_vmem, scratch1_ref, scratch2_ref, sems):
+    core_id, subcore_id = jax.lax.axis_index("core"), jax.lax.axis_index("subcore")
     assert idx_ref.shape[0] % (window * num_subcores * num_cores) == 0
     subcore_slice = idx_ref.shape[0] // (num_subcores * num_cores)
+    offset = (core_id * num_subcores + subcore_id) * subcore_slice
 
-    offset = ((core_id * num_subcores + subcore_id) * subcore_slice) // window
-    # @partial(pl.run_scoped, idx_v=pltpu.VMEM(idx_ref.shape, jnp.int32))
-    # def _(idx_v):
-    #  pltpu.sync_copy(idx_ref, idx_v)
+    # prologue
+    start_i = (offset // window) * window
+    pltpu.sync_copy(idx_ref.at[pl.ds(start_i, window)], idx_vmem)
+    pltpu.sync_copy(x_ref.at[idx_vmem], scratch2_ref)
 
-    # def kernel(x_ref, idx_ref, out_ref):
-    #   @partial(pl.run_scoped, idx_vmem2=pltpu.VMEM((window,), jnp.int32))
-    #   def _(idx_vmem2):
-    #     i = pl.program_id(0)
-    #     start_i = (offset + i) * window
-    #     pltpu.sync_copy(idx_ref.at[pl.ds(start_i, window)], idx_vmem2)
-    #     pltpu.sync_copy(x_ref.at[idx_vmem2], out_ref)
-    #     #pltpu.sync_copy(x_ref.at[idx_v[pl.ds(start_i, window)]], out_ref)
-    #     #pltpu.sync_copy(x_ref.at[idx_ref[...]], out_ref)
-    # grid = (subcore_slice // window,)
-    # in_specs = [pl.BlockSpec(x_ref.shape, memory_space=pltpu.ANY),
-    #             pl.BlockSpec(idx_ref.shape, memory_space=pltpu.ANY)]
-    # out_spec = pl.BlockSpec((window,) + o_ref.shape[1:], lambda i: (offset + i,) + (0,) * (o_ref.ndim - 1))
-    # pltpu.emit_pipeline(kernel, grid=grid, in_specs=in_specs, out_specs=out_spec, no_pipelining=True)(
-    #     x_ref, idx_ref, o_ref)
+    @pl.loop(0, subcore_slice - window, step=window)
+    def _(i):
+      start_i = ((offset + i) // window) * window
+      slc, next_slc = pl.ds(start_i, window), pl.ds(start_i + window, window)
 
-    # @partial(pl.run_scoped, idx_v=pltpu.VMEM(idx_ref.shape, jnp.int32))
-    # def _(idx_v):
-    #  pltpu.sync_copy(idx_ref, idx_v)
+      def stage1():
+        with jax.named_scope("stage1"):
+          pltpu.sync_copy(idx_ref.at[next_slc], idx_vmem)
+          copy_to = pltpu.async_copy(x_ref.at[idx_vmem], scratch1_ref, sems.at[0])
+          copy_from = pltpu.async_copy(scratch2_ref, o_ref.at[slc, ...], sems.at[1])
+          copy_to.wait()
+          copy_from.wait()
 
-    @partial(pl.run_scoped, idx_vmem2=pltpu.VMEM((2, window,), jnp.int32), sems=pltpu.SemaphoreType.DMA((6,)))
-    def _(idx_vmem2, sems):
-      # for i in range(0, subcore_slice, window):
-      # @pl.loop(0, subcore_slice, step=64)
-      # def _(i):
-      #  for j in range(0, 64, window):
+      def stage2():
+        with jax.named_scope("stage2"):
+          pltpu.sync_copy(idx_ref.at[next_slc], idx_vmem)
+          copy_to = pltpu.async_copy(x_ref.at[idx_vmem], scratch2_ref, sems.at[2])
+          copy_from = pltpu.async_copy(scratch1_ref, o_ref.at[slc, ...], sems.at[3])
+          copy_to.wait()
+          copy_from.wait()
 
-      start_i = (core_id * num_subcores + subcore_id) * subcore_slice
-      pltpu.sync_copy(idx_ref.at[pl.ds(start_i, window)], idx_vmem2.at[0, ...])
-      pltpu.sync_copy(x_ref.at[idx_vmem2.at[0, ...]], scratch_2)
-      pltpu.sync_copy(idx_ref.at[pl.ds(start_i + window, window)], idx_vmem2.at[0, ...])
+      jax.lax.cond(jax.lax.rem(i // window, 2) == 0, stage1, stage2)
 
-      @pl.loop(0, subcore_slice - window, step=window)
-      def _(i):
-        for _ in range(1):
-          i_ = i
-          # i_ = i + j
-          start_i = (core_id * num_subcores + subcore_id) * subcore_slice + i_
-          start_i = (start_i // window) * window
-          # start_i = pl.multiple_of(start_i, window)
+    # epilogue
+    start_i = ((offset + subcore_slice - window) // window) * window
+    pltpu.sync_copy(idx_ref.at[pl.ds(start_i, window)], idx_vmem)
+    pltpu.sync_copy(x_ref.at[idx_vmem], scratch2_ref)
+    pltpu.sync_copy(scratch2_ref, o_ref.at[pl.ds(start_i, window), ...])
 
-          slc = pl.ds(start_i, window)
-          nxt_slc = pl.ds(start_i + window, window)
-
-          # pltpu.sync_copy(x_ref.at[idx_v[slc]], x_scratch_ref)
-
-          # with jax.named_scope("indices"):
-          #  pltpu.sync_copy(idx_ref.at[pl.ds(start_i, window)], idx_vmem2.at[0, ...])
-          # with jax.named_scope("to_vmem"):
-          #  pltpu.sync_copy(x_ref.at[idx_vmem2.at[0, ...]], x_scratch_ref.at[0, ...])
-          # with jax.named_scope("from_vmem"):
-          #  pltpu.sync_copy(x_scratch_ref.at[0, ...], o_ref.at[slc, ...])
-
-          # idx_vmem[1, ...] = idx_vmem[0, ...]
-          # x_scratch_ref[1, ...] = x_scratch_ref[0, ...]
-          # pltpu.sync_copy(x_scratch_ref.at[0, ...], x_scratch_ref.at[1, ...])
-
-          # copy_idx = pltpu.async_copy(idx_ref.at[pl.ds(start_i, window)], idx_vmem2.at[0, ...], sems.at[0])
-          def ver1():
-            with jax.named_scope("ver1"):
-              pltpu.sync_copy(idx_ref.at[nxt_slc], idx_vmem2.at[0, ...])
-              # copy_idx = pltpu.async_copy(idx_ref.at[nxt_slc], idx_vmem2.at[1, ...], sems.at[0])
-              copy_to = pltpu.async_copy(x_ref.at[idx_vmem2.at[0, ...]], x_scratch_ref, sems.at[1])
-              copy_from = pltpu.async_copy(scratch_2, o_ref.at[slc, ...], sems.at[2])
-
-            # @pl.loop(0, x_scratch_ref.shape[0], step=1, unroll=True)
-            # def _(j):
-            #  @pl.loop(0, x_scratch_ref.shape[1], step=1, unroll=True)
-            #  def _(k):
-            #    @pl.loop(0, x_scratch_ref.shape[2], step=64, unroll=False)
-            #    def _(l):
-            #      x_scratch_ref[j, k, pl.ds(l, 64)] = scratch_2[j, k, pl.ds(l, 64)]
-
-              # copy_idx.wait()
-              copy_to.wait()
-              copy_from.wait()
-
-          def ver2():
-            with jax.named_scope("ver2"):
-              pltpu.sync_copy(idx_ref.at[nxt_slc], idx_vmem2.at[1, ...])
-              # copy_idx = pltpu.async_copy(idx_ref.at[nxt_slc], idx_vmem2.at[0, ...], sems.at[3])
-              copy_to = pltpu.async_copy(x_ref.at[idx_vmem2.at[1, ...]], scratch_2, sems.at[4])
-              copy_from = pltpu.async_copy(x_scratch_ref, o_ref.at[slc, ...], sems.at[5])
-              # copy_idx.wait()
-              copy_to.wait()
-              copy_from.wait()
-
-          jax.lax.cond(jax.lax.rem(i // window, 2) == 0, ver1, ver2)
-          # pltpu.sync_copy(x_scratch_ref, o_ref.at[pl.ds((subcore_slice- window), window)])
-
-          # pltpu.sync_copy(x_ref.at[idx_vmem], o_ref.at[pl.ds(start_i, window), ...])
-
-          # pltpu.sync_copy(idx_ref.at[pl.ds(start_i, window)], idx_vmem2)
-          # pltpu.sync_copy(x_ref.at[idx_vmem2], o_ref.at[pl.ds(start_i, window), ...])
-      print("final2")
-      final_idx = (core_id * num_subcores + subcore_id + 1) * subcore_slice - window
-      final_idx = (final_idx // window) * window
-      pltpu.sync_copy(idx_ref.at[pl.ds(final_idx, window)], idx_vmem2.at[0, ...])
-      pltpu.sync_copy(x_ref.at[idx_vmem2.at[0, ...]], scratch_2)
-      pltpu.sync_copy(scratch_2, o_ref.at[pl.ds(final_idx, window), ...])
-      # pltpu.sync_copy(scratch_2, o_ref.at[pl.ds((subcore_slice- window), window), ...])
-
-  gather()
+  _gather()
   return o_ref[...]
 
 
-def _sc_gather(x, idx):
+def sc_scatter(out: jax.Array, idx: jax.Array, x: jax.Array, window: int | None = None):
   tpu_info = pltpu.get_tpu_info().sparse_core
-  num_cores, num_subcores, window = tpu_info.num_cores, tpu_info.num_subcores, tpu_info.num_lanes
-  num_cores = 2
-  out_shape = jax.ShapeDtypeStruct((idx.shape[0], *x.shape[1:]), x.dtype)
-  out = 17 * jnp.ones(out_shape.shape, out_shape.dtype)
-  x_ref, idx_ref, o_ref = jax.tree.map(jax.new_ref, (x, idx, out))
+  num_cores, num_subcores = tpu_info.num_cores, tpu_info.num_subcores
+  window = tpu_info.num_lanes if window is None else window
+  o_ref, idx_ref, x_ref = jax.tree.map(jax.new_ref, (out, idx, x))
 
   @pl.kernel(
-      # out_shape=out_shape,
       out_shape=(),
       mesh=plsc.VectorSubcoreMesh(
             core_axis_name="core", subcore_axis_name="subcore", num_cores=num_cores
       ),
       scratch_shapes=(
           pltpu.VMEM((window,), jnp.int32),
-          pltpu.VMEM((window, x.shape[1]), x.dtype),
-      #    pltpu.VMEM((window, x.shape[1] * LANES), dtype),
+          pltpu.VMEM((window, *x.shape[1:]), x.dtype),
+          pltpu.VMEM((window, *x.shape[1:]), x.dtype),
+          pltpu.SemaphoreType.DMA((4,)),
       ),
   )
-  def gather(idx_vmem, x_scratch_ref):  # , o_scratch_ref):
-    core_id = jax.lax.axis_index("core")
-    subcore_id = jax.lax.axis_index("subcore")
-    # @pl.when((subcore_id == 0) & (core_id == 0))
-    # def _():
+  def _scatter(idx_vmem, scratch1_ref, scratch2_ref, sems):
+    core_id, subcore_id = jax.lax.axis_index("core"), jax.lax.axis_index("subcore")
     assert idx_ref.shape[0] % (window * num_subcores * num_cores) == 0
     subcore_slice = idx_ref.shape[0] // (num_subcores * num_cores)
+    offset = (core_id * num_subcores + subcore_id) * subcore_slice
 
-    offset = ((core_id * num_subcores + subcore_id) * subcore_slice) // window
+    # prologue
+    start_i = (offset // window) * window
+    pltpu.sync_copy(idx_ref.at[pl.ds(start_i, window)], idx_vmem)
+    pltpu.sync_copy(x_ref.at[pl.ds(start_i, window), ...], scratch2_ref)
 
-    @partial(pl.run_scoped, idx_v=pltpu.VMEM(idx_ref.shape[0], jnp.int32))
-    def _(idx_v):
-      pltpu.sync_copy(idx_ref, idx_v)
+    @pl.loop(0, subcore_slice - window, step=window)
+    def _(i):
+      start_i = ((offset + i) // window) * window
+      slc, next_slc = pl.ds(start_i, window), pl.ds(start_i + window, window)
 
-      def kernel(out_ref):
-        @partial(pl.run_scoped, idx_vmem2=pltpu.VMEM((window,), jnp.int32))
-        def _(idx_vmem2):
-          i = pl.program_id(0)
-          start_i = (offset + i) * window
-          # pltpu.sync_copy(idx_ref.at[pl.ds(start_i, window)], idx_vmem2)
-          # pltpu.sync_copy(x_ref.at[idx_vmem2], out_ref)
-          pltpu.sync_copy(x_ref.at[idx_v[pl.ds(start_i, window)]], out_ref)
-          # pltpu.sync_copy(x_ref.at[idx_ref[...]], out_ref)
+      def stage1():
+        with jax.named_scope("stage1"):
+          pltpu.sync_copy(idx_ref.at[slc], idx_vmem)
+          copy_to = pltpu.async_copy(x_ref.at[next_slc, ...], scratch1_ref, sems.at[0])
+          copy_from = pltpu.async_copy(scratch2_ref, o_ref.at[idx_vmem], sems.at[1])
+          copy_to.wait()
+          copy_from.wait()
 
-      grid = (subcore_slice // window,)
-      in_specs = [
-        # pl.BlockSpec((window,), lambda i: offset + i)
-      ]
-      out_spec = pl.BlockSpec((window,) + o_ref.shape[1:], lambda i: (offset + i, 0))
-      pltpu.emit_pipeline(kernel, grid=grid, in_specs=in_specs, out_specs=out_spec)(o_ref)
+      def stage2():
+        with jax.named_scope("stage2"):
+          pltpu.sync_copy(idx_ref.at[slc], idx_vmem)
+          copy_to = pltpu.async_copy(x_ref.at[next_slc, ...], scratch2_ref, sems.at[2])
+          copy_from = pltpu.async_copy(scratch1_ref, o_ref.at[idx_vmem], sems.at[3])
+          copy_to.wait()
+          copy_from.wait()
 
-    # @pl.loop(0, subcore_slice, step=window)
-    # def _(i):
-    #  @partial(pl.run_scoped, idx_vmem2=pltpu.VMEM((window,), jnp.int32))
-    #  def _(idx_vmem2):
-    #    start_i = (core_id * num_subcores + subcore_id) * subcore_slice + i
-    #    start_i = (start_i // window) * window
-    #    #start_i = pl.multiple_of(start_i, window)
-    #    #pltpu.sync_copy(idx_ref.at[pl.ds(start_i, window)], idx_vmem2)
-    #    #pltpu.sync_copy(x_ref.at[idx_vmem2], x_scratch_ref)
-    #    #pltpu.sync_copy(x_scratch_ref, o_ref.at[pl.ds(start_i, window), ...])
-    #    #pltpu.sync_copy(x_ref.at[idx_vmem], o_ref.at[pl.ds(start_i, window), ...])
+      jax.lax.cond(jax.lax.rem(i // window, 2) == 0, stage1, stage2)
 
-    #    pltpu.sync_copy(idx_ref.at[pl.ds(start_i, window)], idx_vmem2)
-    #    pltpu.sync_copy(x_ref.at[idx_vmem2], o_ref.at[pl.ds(start_i, window), ...])
+    # epilogue
+    start_i = ((offset + subcore_slice - window) // window) * window
+    pltpu.sync_copy(idx_ref.at[pl.ds(start_i, window)], idx_vmem)
+    pltpu.sync_copy(x_ref.at[pl.ds(start_i, window)], scratch2_ref)
+    pltpu.sync_copy(scratch2_ref, o_ref.at[idx_vmem])
 
-  gather()
+  _scatter()
   return o_ref[...]
 
 
