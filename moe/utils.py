@@ -1,7 +1,6 @@
 import contextlib
 import dataclasses
 import os
-import random
 from functools import partial
 from pathlib import Path
 from subprocess import Popen
@@ -10,6 +9,7 @@ import jax
 import jax.experimental.pallas as pl
 import jax.numpy as jnp
 from jax.sharding import Sharding
+import psutil
 
 
 zip_ = zip
@@ -171,8 +171,11 @@ _tb_process, _tb_port = None, None
 def profile(path="/tmp/profiles"):
   global _tb_process, _tb_port
   if _tb_process is None:
+    _tb_port = 52432
+    used_ports = {p.laddr.port for p in psutil.net_connections()}
+    while _tb_port in used_ports:
+      _tb_port += 1
     devnull = open(os.devnull, "w")
-    _tb_port = 52432 + random.randint(0, 1000)
     _tb_process = Popen(["xprof", "--port", str(_tb_port), "--logdir", path], stdout=devnull, stderr=devnull)
 
   with jax.profiler.trace("/tmp/profiles"):

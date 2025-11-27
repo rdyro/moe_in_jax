@@ -7,7 +7,6 @@ os.environ["LIBTPU_INIT_ARGS"] = " ".join([
   "--xla_tpu_enable_offloading_scatter_to_sparsecore=true",
   "--xla_tpu_offload_all_supported_gathers_to_sparsecore=true",
   "--xla_tpu_offload_gather_to_sparsecore=true",
-  "--xla_tpu_offload_all_supported_gathers_to_sparsecore=true",
 ])
 # os.environ["XLA_FLAGS"] = "--xla_gpu_enable_command_buffer=''"  # let named_scopes show up on GPU
 
@@ -69,10 +68,23 @@ def main():
   # ra2a_fn = moe.ra2a_simulator.ragged_all_to_all
   opts = dict(axis_name="x", experts_num=g, multiple=multiple, ragged_all_to_all=ra2a_fn, compute_block=compute)
 
+  def _run_moe(x, all_idxs, fn):
+    slices = 4
+    ss = x.shape[0] // slices
+    outs = []
+    for i in range(slices):
+      x_ = x[ss * i:ss * (i + 1), ...]
+      all_idxs_ = all_idxs[experts_per_tok * ss * i:experts_per_tok * ss * (i + 1), ...]
+      outs.append(jnp.sum(fn(x_, all_idxs_), (-1, -2)))
+    return jnp.concatenate(outs, 0)
+
   # run_moe = partial(moe.core.run_moe, **opts)
   # run_moe2 = partial(moe.core.run_moe, **opts, custom_gathers=True)
-  run_moe = lambda x, all_idxs: jnp.sum(partial(moe.core.run_moe, **opts)(x, all_idxs), (-1, -2))
-  run_moe2 = lambda x, all_idxs: jnp.sum(partial(moe.core.run_moe, **opts, custom_gathers=True)(x, all_idxs), (-1, -2))
+  # run_moe = lambda x, all_idxs: jnp.sum(partial(moe.core.run_moe, **opts)(x, all_idxs), (-1, -2))
+  # run_moe2 = lambda x, all_idxs: jnp.sum(partial(moe.core.run_moe, **opts, custom_gathers=True)(x, all_idxs),
+  #                                        (-1, -2))
+  run_moe = lambda x, all_idxs: _run_moe(x, all_idxs, partial(moe.core.run_moe, **opts))
+  run_moe2 = lambda x, all_idxs: _run_moe(x, all_idxs, partial(moe.core.run_moe, **opts, custom_gathers=True))
 
   run_moe_jit = jax.jit(run_moe)
   run_moe2_jit = jax.jit(run_moe2)

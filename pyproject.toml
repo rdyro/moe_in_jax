@@ -2,7 +2,7 @@
 name = "moe"
 version = "0.0.1"
 authors = [{ name = "Robert Dyro" }, { name = "Gleb Pobudzey" }]
-dependencies = ["jax", "numpy", "tqdm"]
+dependencies = ["jax", "numpy", "tqdm", "psutil"]
 description = "Efficient expert parallelism in MoE in JAX"
 readme = "README.md"
 license = { file = "LICENSE" }

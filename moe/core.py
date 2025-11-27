@@ -19,10 +19,10 @@ SENTINEL_VALUE = 2 ** 31 - 1
 
 
 def run_moe(x: jax.Array, all_idxs: jax.Array,
-            compute_block: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
+            compute_block: Callable[[jax.Array, jax.Array | None], jax.Array] | None = None,
             reduce_block: Callable[[jax.Array], jax.Array] | None = None,
             ragged_all_to_all: RaggedAllToCallCallable = jax.lax.ragged_all_to_all,
-            *, axis_name: str, experts_num: int, safety_factor: int = 2, multiple: int = 1,
+            *, axis_name: str, experts_num: int, safety_factor: float = 1.2, multiple: int = 1,
             custom_gathers: bool = False):
 
   out_specs = P(axis_name, *[None for _ in range(x.ndim - 1)])
@@ -83,7 +83,7 @@ def run_moe(x: jax.Array, all_idxs: jax.Array,
         update = jnp.roll(all_local_expert_idxs[i, :], -all_input_offsets[i, shard_idx])
         return jax.lax.dynamic_update_slice_in_dim(local_expert_idxs, update, all_output_offsets[i, shard_idx], 0)
 
-      bef = x.shape[0] * experts_per_tok * safety_factor  # batch * expert_per_token * safety factor
+      bef = round(x.shape[0] * experts_per_tok * safety_factor)  # batch * expert_per_token * safety factor
       local_expert_idxs = jax.lax.empty((bef + all_local_expert_idxs.shape[-1],), jnp.int32)
       local_expert_idxs = jax.lax.fori_loop(0, num_shards, _update_fn, local_expert_idxs)[:bef]
       local_pack_mask = jnp.arange(local_expert_idxs.size) < jnp.sum(recv_sizes)
@@ -119,7 +119,7 @@ def run_moe(x: jax.Array, all_idxs: jax.Array,
     with jax.named_scope("ra2a_tokens"):
       total_recv_size = jnp.sum(recv_sizes)
       # check that (total_recv_size / x.shape[0] * experts_per_token) < safety_factor
-      buffer = jax.lax.empty((x.shape[0] * experts_per_tok * safety_factor,) + x.shape[1:], dtype=x.dtype)
+      buffer = jax.lax.empty((round(x.shape[0] * experts_per_tok * safety_factor),) + x.shape[1:], dtype=x.dtype)
       y = ragged_all_to_all(x_sort, buffer, *dataclasses.astuple(preamble), axis_name=axis_name)
 
     # step 3: gather tokens locally so they're expert-contiguous
@@ -161,6 +161,79 @@ def run_moe(x: jax.Array, all_idxs: jax.Array,
     with jax.named_scope("reduction_across_experts"):
       if reduce_block is not None:
         y = reduce_block(y)
+
+    return y
+
+  return fn(x, all_idxs)
+
+
+def run_moe_ag(x: jax.Array, all_idxs: jax.Array,
+               compute_block: Callable[[jax.Array, jax.Array | None], jax.Array] | None = None,
+               reduce_block: Callable[[jax.Array], jax.Array] | None = None,
+               ragged_all_to_all: RaggedAllToCallCallable = jax.lax.ragged_all_to_all,
+               *, axis_name: str, experts_num: int, safety_factor: float = 1.2, multiple: int = 1,
+               custom_gathers: bool = False):
+
+  out_specs = P(axis_name, *[None for _ in range(x.ndim - 1)])
+
+  @partial(jax.shard_map, out_specs=out_specs, check_vma=False)
+  def fn(x: jax.Array, all_idxs: jax.Array):
+    shard_idx, num_shards = jax.lax.axis_index(axis_name), jax.lax.axis_size(axis_name)
+    experts_per_shard = experts_num // num_shards
+    experts_per_tok = all_idxs.size // x.shape[0] // num_shards  # because all_idxs is replicated
+    assert all_idxs.ndim in (1, 2), f"{jax.typeof(all_idxs)=} should be stacked (expert_shards, -1) or tiled (-1,)"
+
+    ####################################################################################################################
+    # metadata computation #############################################################################################
+    ####################################################################################################################
+
+    with jax.named_scope("all_gather_tokens"):
+      all_x = jax.lax.all_gather(x, axis_name, axis=0, tiled=True)
+
+    with jax.named_scope("compute_metadata"):
+      if all_idxs.ndim != 1:
+        all_idxs = all_idxs.reshape(-1)
+      valid_mask = (all_idxs >= shard_idx * experts_per_shard) & (all_idxs < (shard_idx + 1) * experts_per_shard)
+      valid_idxs = jnp.where(valid_mask, all_idxs, SENTINEL_VALUE)
+      total_local_size = jnp.sum(valid_mask)
+      # jax.debug.print("total_local_size = {}", total_local_size)
+
+      bef = round(x.shape[0] * experts_per_tok * safety_factor)  # batch * expert_per_token * safety factor
+      local_sort = jnp.argsort(valid_idxs)[:bef]
+      local_isort = jnp.argsort(local_sort)[:bef]
+
+      # local_permute = compute_padded_group_gather(local_expert_idxs_, experts_per_shard, multiple=multiple,
+      #                                            group_counts=local_group_counts)
+      # local_group_counts = local_permute.group_counts_with_padding
+
+    ####################################################################################################################
+    # compute ##########################################################################################################
+    ####################################################################################################################
+
+    # step 3: gather tokens locally so they're expert-contiguous
+    with jax.named_scope("local_gather_before"):
+      y = all_x[local_sort // experts_per_tok, ...]
+
+    # step 4: perform gmm computation
+    with jax.named_scope("compute"):
+      if compute_block is not None:
+        # y = compute_block(y, local_group_counts)
+        y = compute_block(y, None)
+      mask = jnp.expand_dims(jnp.arange(y.shape[0]) < total_local_size, tuple(range(1, y.ndim)))
+      # jax.debug.print("mask = {}", jnp.mean(mask))
+      y = jnp.where(mask, y, 0)
+
+    # step 5: unpermute tokens locally to organize them into chunks in which they arrived
+    with jax.named_scope("local_scatter_after"):
+      y = jnp.zeros(all_x.shape, dtype=all_x.dtype).at[local_sort // experts_per_tok, ...].add(y)
+      # y = (17 * jnp.ones(all_x.shape, dtype=all_x.dtype)).at[local_sort // experts_per_tok, ...].set(y)
+      # y = (17 * jnp.zeros(all_x.shape, dtype=all_x.dtype)).at[local_sort // experts_per_tok, ...].set(y)
+      # jax.debug.print("local_sort = {}", local_sort[-100:])
+
+    # jax.debug.print("low indices = {}", jnp.mean(local_sort // experts_per_tok < 32))
+
+    with jax.named_scope("reduce-scatter"):
+      y = jax.lax.psum_scatter(y, axis_name=axis_name, scatter_dimension=0, tiled=True)
 
     return y
 
