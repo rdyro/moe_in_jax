@@ -79,12 +79,12 @@ def main():
     return jnp.concatenate(outs, 0)
 
   # run_moe = partial(moe.core.run_moe, **opts)
-  # run_moe2 = partial(moe.core.run_moe, **opts, custom_gathers=True)
+  # run_moe2 = partial(moe.core.run_moe, **opts, gathers="custom")
   # run_moe = lambda x, all_idxs: jnp.sum(partial(moe.core.run_moe, **opts)(x, all_idxs), (-1, -2))
-  # run_moe2 = lambda x, all_idxs: jnp.sum(partial(moe.core.run_moe, **opts, custom_gathers=True)(x, all_idxs),
+  # run_moe2 = lambda x, all_idxs: jnp.sum(partial(moe.core.run_moe, **opts, gathers="custom")(x, all_idxs),
   #                                        (-1, -2))
   run_moe = lambda x, all_idxs: _run_moe(x, all_idxs, partial(moe.core.run_moe, **opts))
-  run_moe2 = lambda x, all_idxs: _run_moe(x, all_idxs, partial(moe.core.run_moe, **opts, custom_gathers=True))
+  run_moe2 = lambda x, all_idxs: _run_moe(x, all_idxs, partial(moe.core.run_moe, **opts, gathers="custom"))
 
   run_moe_jit = jax.jit(run_moe)
   run_moe2_jit = jax.jit(run_moe2)

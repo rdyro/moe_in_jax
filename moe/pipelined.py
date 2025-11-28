@@ -1,69 +1,47 @@
 import dataclasses
 from functools import partial
-from typing import Callable, Protocol, NamedTuple, Literal
+from typing import Callable, Literal
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec as P
 
-from .utils import RA2AMeta, add_indices, compute_padded_group_gather, unique_gather, PaddedGroupPaddedMetadata
-from .utils import register_jax_dataclass
+from .utils import RA2AMeta, add_indices, compute_padded_group_gather, unique_gather, register_jax_dataclass
+from .core import RaggedAllToCallCallable, SENTINEL_VALUE, MoEMeta, MoEInfo, GathersType, SPARSECORE_PAD_SIZE
 from . import sc_kernels as sc
 
 
-class RaggedAllToCallCallable(Protocol):
-  def __call__(self, operand: jax.Array, output: jax.Array, input_offsets: jax.Array, send_sizes: jax.Array,
-               output_offsets: jax.Array, recv_sizes: jax.Array, *, axis_name: str) -> jax.Array:
-    ...
-
-
-SENTINEL_VALUE = 2 ** 31 - 1
-SPARSECORE_PAD_SIZE = 1024
-
-
-GathersType = Literal["builtin", "custom", "custom_sc"]
-
-class MoEInfo(NamedTuple):
-  batch_size: int
-  experts_per_tok: int
-  num_experts: int
-
-
-@register_jax_dataclass(meta_fields=["info"])
+@register_jax_dataclass(meta_fields=["compute_meta", "load_fn", "compute_fn", "unload_fn"])
 @dataclasses.dataclass
-class MoEMeta:
-  info: MoEInfo
-  local_ra2a_sort: jax.Array
-  local_ra2a_isort: jax.Array
-  preamble: RA2AMeta
-  epilogue: RA2AMeta
-  local_permute: PaddedGroupPaddedMetadata
+class MoEMethods:
+  compute_meta: Callable[[jax.Array], MoEMeta]
+  load_fn: Callable[[jax.Array, MoEMeta], jax.Array]
+  compute_fn: Callable[[jax.Array, MoEMeta], jax.Array]
+  unload_fn: Callable[[jax.Array, MoEMeta], jax.Array]
 
 
-def run_moe(
-    x: jax.Array, all_idxs: jax.Array,
+def create_moe(
     compute_block: Callable[[jax.Array, jax.Array | None], jax.Array] | None = None,
     ragged_all_to_all: RaggedAllToCallCallable = jax.lax.ragged_all_to_all,
     *,
-    axis_name: str, experts_num: int, safety_factor: float = 1.2, multiple: int = 1, gathers: GathersType = "builtin",
-):
+    axis_name: str,
+    experts_per_tok: int, experts_num: int,
+    safety_factor: float = 1.2, multiple: int = 1, gathers: GathersType = "builtin"
+) -> MoEMethods:
+  assert gathers in ("builtin", "custom", "custom_sc")
 
-  out_specs = P(axis_name, *[None for _ in range(x.ndim - 1)])
+  ######################################################################################################################
+  # metadata computation ###############################################################################################
+  ######################################################################################################################
 
-  @partial(jax.shard_map, out_specs=out_specs, check_vma=False)
-  def fn(x: jax.Array, all_idxs: jax.Array):
+  def compute_meta(all_idxs: jax.Array):
     shard_idx, num_shards = jax.lax.axis_index(axis_name), jax.lax.axis_size(axis_name)
     experts_per_shard = experts_num // num_shards
-    experts_per_tok = all_idxs.size // x.shape[0] // num_shards  # because all_idxs is replicated
     assert all_idxs.ndim in (1, 2), f"{jax.typeof(all_idxs)=} should be stacked (expert_shards, -1) or tiled (-1,)"
-
-    ####################################################################################################################
-    # metadata computation #############################################################################################
-    ####################################################################################################################
 
     with jax.named_scope("compute_metadata"):
       if all_idxs.ndim == 1:
         all_idxs = all_idxs.reshape((num_shards, -1))
+      assert all_idxs.shape[-1] % experts_per_tok == 0
       actual_token_num = all_idxs.shape[-1]
 
       all_sizes = jnp.bincount(all_idxs[shard_idx, :], length=experts_num)
@@ -106,7 +84,7 @@ def run_moe(
         update = jnp.roll(all_local_expert_idxs[i, :], -all_input_offsets[i, shard_idx])
         return jax.lax.dynamic_update_slice_in_dim(local_expert_idxs, update, all_output_offsets[i, shard_idx], 0)
 
-      bef = round(x.shape[0] * experts_per_tok * safety_factor)  # batch * expert_per_token * safety factor
+      bef = round(all_idxs.shape[-1] * safety_factor)  # batch * expert_per_token * safety factor
       bef = ((bef + SPARSECORE_PAD_SIZE - 1) // SPARSECORE_PAD_SIZE) * SPARSECORE_PAD_SIZE
       local_expert_idxs = jax.lax.empty((bef + all_local_expert_idxs.shape[-1],), jnp.int32)
       local_expert_idxs = jax.lax.fori_loop(0, num_shards, _update_fn, local_expert_idxs)[:bef]
@@ -116,27 +94,19 @@ def run_moe(
       # compute the local permutation
       local_expert_idxs_ = jnp.where(local_pack_mask, local_expert_idxs - shard_idx * experts_per_shard, SENTINEL_VALUE)
       local_group_counts = jnp.sum(all_sizes.reshape((num_shards, num_shards, experts_per_shard))[:, shard_idx, :], 0)
-      # local_group_counts = jnp.sum(
-      #   jax.lax.dynamic_slice_in_dim(all_sizes, experts_per_shard * shard_idx, experts_per_shard, axis=-1), 0
-      # )
-      # local_group_counts = jnp.bincount(local_expert_idxs_, length=experts_per_shard)
       local_permute = compute_padded_group_gather(local_expert_idxs_, experts_per_shard, multiple=multiple,
                                                   group_counts=local_group_counts)
-
-      # local_sort = jnp.argsort(local_expert_idxs)
-      # local_isort = jnp.argsort(local_sort)
-      # local_group_sizes = jnp.bincount(
-      #   jnp.where(local_pack_mask, local_expert_idxs - shard_idx * experts_per_shard, SENTINEL_VALUE),
-      #   length=experts_per_shard
-      # )
       local_group_counts = local_permute.group_counts_with_padding
 
-      info = MoEInfo(x.shape[0], experts_per_tok, experts_num)
-      meta = MoEMeta(info, local_ra2a_sort, local_ra2a_isort, preamble, epilogue, local_permute)
+      info = MoEInfo(all_idxs.shape[-1] // experts_per_tok, experts_per_tok, experts_num)
+      return MoEMeta(info, local_ra2a_sort, local_ra2a_isort, preamble, epilogue, local_permute)
 
-    ####################################################################################################################
-    # compute ##########################################################################################################
-    ####################################################################################################################
+  ######################################################################################################################
+  # compute ############################################################################################################
+  ######################################################################################################################
+
+  def load_fn(x: jax.Array, meta: MoEMeta):
+    assert meta.info.batch_size == x.shape[0], f"Expected {meta.info.batch_size=}, but got {x.shape[0]=}."
 
     # step 1: gather local tokens for every expert per token
     with jax.named_scope("tokens_to_experts_gather"):
@@ -151,8 +121,10 @@ def run_moe(
 
     # step 2: communicate expert-gathered-tokens to their corresponding expert shards
     with jax.named_scope("ra2a_tokens"):
-      total_recv_size = jnp.sum(recv_sizes)
+      total_recv_size = jnp.sum(meta.preamble.recv_sizes)
       # check that (total_recv_size / x.shape[0] * experts_per_token) < safety_factor
+      bef = round(meta.info.batch_size * meta.info.experts_per_tok * safety_factor)  # batch * expert_per_token * safety factor
+      bef = ((bef + SPARSECORE_PAD_SIZE - 1) // SPARSECORE_PAD_SIZE) * SPARSECORE_PAD_SIZE
       buffer = jax.lax.empty((bef,) + x.shape[1:], dtype=x.dtype)
       y = ragged_all_to_all(x_sort, buffer, *dataclasses.astuple(meta.preamble), axis_name=axis_name)
 
@@ -164,13 +136,17 @@ def run_moe(
         y = sc.unique_sc_gather(y, meta.local_permute.sort_idx, meta.local_permute.isort_idx, ad_mode="gather")
       else:
         y = y[meta.local_permute.sort_idx, ...]
+    return y
 
+  def compute_fn(y: jax.Array, meta: MoEMeta):
     # step 4: perform gmm computation
+    local_group_counts = meta.local_permute.group_counts_with_padding
     with jax.named_scope("compute"):
       if compute_block is not None:
-        # y = compute_block(y, local_group_counts)
-        y = compute_block(y, meta.local_permute.group_counts_with_padding)
+        y = compute_block(y, local_group_counts)
+    return y
 
+  def unload_fn(y: jax.Array, meta: MoEMeta):
     # step 5: unpermute tokens locally to organize them into chunks in which they arrived
     with jax.named_scope("local_gather_after"):
       if gathers == "custom":
@@ -182,7 +158,7 @@ def run_moe(
 
     # step 6: communincate the chunks back to their origins
     with jax.named_scope("ra2a_results"):
-      out = jax.lax.empty((all_idxs.shape[-1],) + x.shape[1:], dtype=x.dtype)
+      out = jax.lax.empty((meta.info.batch_size * meta.info.experts_per_tok, *y.shape[1:]), dtype=y.dtype)
       x_sort = ragged_all_to_all(y, out, *dataclasses.astuple(meta.epilogue), axis_name=axis_name)
 
     # step 7: gather so each token repeats are next to each other
@@ -194,77 +170,11 @@ def run_moe(
       else:
         y = x_sort[meta.local_ra2a_isort, ...]
 
-    # step 8: reduce across experts
+    # step 8: weigh by expert weights
     with jax.named_scope("reduction_across_experts"):
-      y = y.reshape((x.shape[0], experts_per_tok) + x.shape[1:])
-      y = jnp.sum(y, 1)
+      y = y.reshape((meta.info.batch_size, experts_per_tok) + y.shape[1:])
+      y = jnp.sum(y, axis=1)
 
     return y
 
-  return fn(x, all_idxs)
-
-
-def run_moe_ag(
-    x: jax.Array, all_idxs: jax.Array,
-    compute_block: Callable[[jax.Array, jax.Array | None], jax.Array] | None = None,
-    *,
-    axis_name: str, experts_num: int, safety_factor: float = 1.2, multiple: int = 1, gathers: GathersType = "builtin",
-):
-
-  out_specs = P(axis_name, *[None for _ in range(x.ndim - 1)])
-
-  @partial(jax.shard_map, out_specs=out_specs, check_vma=False)
-  def fn(x: jax.Array, all_idxs: jax.Array):
-    shard_idx, num_shards = jax.lax.axis_index(axis_name), jax.lax.axis_size(axis_name)
-    experts_per_shard = experts_num // num_shards
-    experts_per_tok = all_idxs.size // x.shape[0] // num_shards  # because all_idxs is replicated
-    assert all_idxs.ndim in (1, 2), f"{jax.typeof(all_idxs)=} should be stacked (expert_shards, -1) or tiled (-1,)"
-
-    ####################################################################################################################
-    # metadata computation #############################################################################################
-    ####################################################################################################################
-
-    with jax.named_scope("all_gather_tokens"):
-      all_x = jax.lax.all_gather(x, axis_name, axis=0, tiled=True)
-
-    with jax.named_scope("compute_metadata"):
-      if all_idxs.ndim != 1:
-        all_idxs = all_idxs.reshape(-1)
-      valid_mask = (all_idxs >= shard_idx * experts_per_shard) & (all_idxs < (shard_idx + 1) * experts_per_shard)
-      valid_idxs = jnp.where(valid_mask, all_idxs, SENTINEL_VALUE)
-      total_local_size = jnp.sum(valid_mask)
-      # jax.debug.print("total_local_size = {}", total_local_size)
-
-      bef = round(x.shape[0] * experts_per_tok * safety_factor)  # batch * expert_per_token * safety factor
-      local_sort = jnp.argsort(valid_idxs)[:bef]
-      local_isort = jnp.argsort(local_sort)[:bef]
-
-      # local_permute = compute_padded_group_gather(local_expert_idxs_, experts_per_shard, multiple=multiple,
-      #                                            group_counts=local_group_counts)
-      # local_group_counts = local_permute.group_counts_with_padding
-
-    ####################################################################################################################
-    # compute ##########################################################################################################
-    ####################################################################################################################
-
-    # step 3: gather tokens locally so they're expert-contiguous
-    with jax.named_scope("local_gather_before"):
-      y = all_x[local_sort // experts_per_tok, ...]
-
-    # step 4: perform gmm computation
-    with jax.named_scope("compute"):
-      if compute_block is not None:
-        y = compute_block(y, None)
-      mask = jnp.expand_dims(jnp.arange(y.shape[0]) < total_local_size, tuple(range(1, y.ndim)))
-      y = jnp.where(mask, y, 0)
-
-    # step 5: unpermute tokens locally to organize them into chunks in which they arrived
-    with jax.named_scope("local_scatter_after"):
-      y = jnp.zeros(all_x.shape, dtype=all_x.dtype).at[local_sort // experts_per_tok, ...].add(y)
-
-    with jax.named_scope("reduce-scatter"):
-      y = jax.lax.psum_scatter(y, axis_name=axis_name, scatter_dimension=0, tiled=True)
-
-    return y
-
-  return fn(x, all_idxs)
+  return MoEMethods(compute_meta, load_fn, compute_fn, unload_fn)

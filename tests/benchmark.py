@@ -70,9 +70,9 @@ def main():
   opts = dict(axis_name="x", experts_num=g, multiple=multiple, ragged_all_to_all=ra2a_fn, compute_block=compute)
 
   # run_moe = partial(moe.core.run_moe, **opts)
-  # run_moe2 = partial(moe.core.run_moe, **opts, custom_gathers=True)
+  # run_moe2 = partial(moe.core.run_moe, **opts, gathers="custom")
   run_moe = lambda x, all_idxs: jnp.sum(partial(moe.core.run_moe, **opts)(x, all_idxs), (-1, -2))
-  run_moe2 = lambda x, all_idxs: jnp.sum(partial(moe.core.run_moe, **opts, custom_gathers=True)(x, all_idxs), (-1, -2))
+  run_moe2 = lambda x, all_idxs: jnp.sum(partial(moe.core.run_moe, **opts, gathers="custom")(x, all_idxs), (-1, -2))
 
   run_moe_jit = jax.jit(run_moe)
   run_moe2_jit = jax.jit(run_moe2)

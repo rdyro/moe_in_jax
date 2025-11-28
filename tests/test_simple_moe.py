@@ -24,6 +24,7 @@ random_randint = lambda key, shape, minval, maxval: jnp.array(np.random.default_
 
 class MoeTest(parameterized.TestCase):
   @parameterized.product(
+      # TODO(rdyro): figure out why multiple = 8 doesn't work here (in fwd pass wrt reference, not o1 vs o2)
       # experts_per_tok=[1, 2, 4], device=["cpu", "tpu", "cuda"], multiple=[1, 2, 8], with_compute=[True, False]
       experts_per_tok=[1, 2, 4], device=["cpu", "tpu", "cuda"], multiple=[1], with_compute=[True, False]
   )
@@ -49,11 +50,11 @@ class MoeTest(parameterized.TestCase):
         assert (g // len(devices)) == group_sizes.size
         group_idxs = group_sizes.size * shard_idx + jnp.arange(group_sizes.size)
         weights = jnp.sum(((iota >= starts[None, :]) & (iota < ends[None, :])) * group_idxs[None, :], -1)
-        return y * weights[:, None]
+        return y * jnp.expand_dims(weights, tuple(range(1, y.ndim)))
 
       opts = dict(axis_name="x", experts_num=g, ragged_all_to_all=ra2a_via_ag, multiple=multiple, compute_block=compute)
-      moe1_fn = jax.jit(partial(run_moe, **opts, custom_gathers=False))
-      moe2_fn = jax.jit(partial(run_moe, **opts, custom_gathers=True))
+      moe1_fn = jax.jit(partial(run_moe, **opts, gathers="builtin"))
+      moe2_fn = jax.jit(partial(run_moe, **opts, gathers="custom"))
       o1, vjp1_fn = jax.vjp(partial(moe1_fn, all_idxs=all_idxs), x)
       o2, vjp2_fn = jax.vjp(partial(moe2_fn, all_idxs=all_idxs), x)
 
@@ -61,11 +62,13 @@ class MoeTest(parameterized.TestCase):
       x_ref = jnp.repeat(x, experts_per_tok, axis=0, out_sharding=P(axis_name, None))
       x_ref = x_ref.reshape((x.shape[0], experts_per_tok, x.shape[1]))
       x_ref *= all_idxs.reshape((x.shape[0], experts_per_tok, 1))
-      np.testing.assert_allclose(x_ref, o1)
+      x_ref = jnp.sum(x_ref, 1)
       np.testing.assert_allclose(o1, o2)
+      np.testing.assert_allclose(x_ref, o1)
 
-      r = jax.jit(lambda: jax.random.normal(jax.random.key(1), o1.shape, dtype=x.dtype),
-                  out_shardings=P(axis_name, None, None))()
+      r = jax.jit(
+        lambda: jax.random.normal(jax.random.key(1), o1.shape, dtype=x.dtype), out_shardings=P(axis_name, None)
+      )()
       (do1,) = vjp1_fn(r)
       (do2,) = vjp2_fn(r)
       do1_error = jnp.max(jnp.linalg.norm(do1 - do2, axis=-1) / jnp.maximum(jnp.linalg.norm(do1, axis=-1), 1e-7))
@@ -82,16 +85,14 @@ class MoeTest(parameterized.TestCase):
 
     with jax.sharding.set_mesh(mesh):
       n, k, g = 256, 2048, 32
-      # x, ra2a_meta = generate_data(n, k, len(devices), axis_name="x")
-      # del ra2a_meta
       x = jax.random.normal(jax.random.key(0), (n, k), dtype="bfloat16")
       all_idxs = jax.random.randint(jax.random.key(0), (experts_per_tok * x.shape[0],), minval=0, maxval=g)
       x, all_idxs = jax.device_put(x, P(axis_name, None)), jax.device_put(all_idxs, P(None))
       out = run_moe(x, all_idxs, axis_name="x", experts_num=g, ragged_all_to_all=ra2a_via_ag)
-      self.assertEqual(out.shape, (n, experts_per_tok, x.shape[-1]))
+      out = out / experts_per_tok
+      self.assertEqual(out.shape, (n, x.shape[-1]))
 
-      x_new = np.array(out[:, 0, :])
-      np.testing.assert_allclose(x, x_new)
+      np.testing.assert_allclose(x, out)
 
   @parameterized.product(experts=[32, 128], multiple=[2, 4, 8])
   def test_add_indices_works_for_moe(self, experts, multiple):
@@ -115,12 +116,12 @@ class MoeTest(parameterized.TestCase):
       all_idxs = jax.random.randint(jax.random.key(0), experts_per_tok * m, minval=0, maxval=g)
       x, ra2a_meta = generate_data(m, k, device_num=len(devices), axis_name=axis_name)
       del ra2a_meta
-      reduce_block = lambda x: x[:, 0, ...]
-      moe_fn = jax.jit(partial(run_moe, reduce_block=reduce_block, axis_name=axis_name, experts_num=g,
-                               multiple=multiple, ragged_all_to_all=ra2a_via_ag))
-      out = moe_fn(x, all_idxs)
+      moe_fn = jax.jit(partial(
+          run_moe, axis_name=axis_name, experts_num=g, multiple=multiple, ragged_all_to_all=ra2a_via_ag
+      ))
+      out = moe_fn(x, all_idxs) / experts_per_tok
       self.assertEqual(out.shape, (m, x.shape[-1]))
-      np.testing.assert_array_equal(out, x)
+      np.testing.assert_allclose(x, out, rtol=1e-5)
 
 
 if __name__ == "__main__":

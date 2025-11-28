@@ -4,6 +4,7 @@ import os
 from functools import partial
 from pathlib import Path
 from subprocess import Popen
+from typing import Any, TypeVar, Callable
 
 import jax
 import jax.experimental.pallas as pl
@@ -15,12 +16,23 @@ import psutil
 zip_ = zip
 zip = partial(zip_, strict=True)
 
+T = TypeVar("T")
 
-@partial(
-  jax.tree_util.register_dataclass,
-  data_fields=["input_offsets", "send_sizes", "output_offsets", "recv_sizes"],
-  meta_fields=[],
-)
+
+def register_jax_dataclass(cls: T | None = None, *, meta_fields: list[str] | None = []) -> T | Callable[[T], T]:
+  """Register a dataclass with jax.tree_util, but only by specifying meta fields, data fields are implicit."""
+
+  def _register_fn(cls) -> T:
+    meta_fields_ = meta_fields or []
+    if not dataclasses.is_dataclass(cls):
+      cls = dataclasses.dataclass(cls)
+    data_fields = [x.name for x in dataclasses.fields(cls) if x.name not in meta_fields_]
+    return jax.tree_util.register_dataclass(cls, meta_fields=meta_fields_, data_fields=data_fields)
+
+  return _register_fn(cls) if cls is not None else _register_fn
+
+
+@register_jax_dataclass
 @dataclasses.dataclass
 class RA2AMeta:
   """Holds sizes and offsets for ragged all-to-all communication."""
@@ -100,9 +112,7 @@ def scatter_arange(total_length: jax.Array, counts: jax.Array, multiple: int = 4
   return jnp.where(some_mask, jnp.sum(full, 0), -1), some_mask
 
 
-@partial(jax.tree_util.register_dataclass, meta_fields=[], data_fields=[
-  "group_counts", "group_counts_with_padding", "group_idx", "group_idx_with_padding", "sort_idx", "isort_idx"
-])
+@register_jax_dataclass
 @dataclasses.dataclass
 class PaddedGroupPaddedMetadata:
   group_idx: jax.Array
@@ -147,8 +157,8 @@ def unique_gather_fwd(x: jax.Array, idx: jax.Array, inv_idx: jax.Array, ad_mode:
   return unique_gather(x, idx, inv_idx, **static), (x.shape, inv_idx,)
 
 
-def unique_gather_bwd(ad_mode: str, empty_for_scatter: bool, res, g):
-  (x_shape, inv_idx,) = res
+def unique_gather_bwd(ad_mode: str, empty_for_scatter: bool, res: tuple[Any, jax.Array], g: jax.Array):
+  (x_shape, inv_idx) = res
   if ad_mode == "gather":
     grad = g[inv_idx, ...]
   else:  # scatter
