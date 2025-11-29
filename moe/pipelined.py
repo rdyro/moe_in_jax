@@ -1,6 +1,6 @@
 import dataclasses
 from functools import partial
-from typing import Callable, Literal
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -122,9 +122,12 @@ def create_moe(
     # step 2: communicate expert-gathered-tokens to their corresponding expert shards
     with jax.named_scope("ra2a_tokens"):
       total_recv_size = jnp.sum(meta.preamble.recv_sizes)
-      # check that (total_recv_size / x.shape[0] * experts_per_token) < safety_factor
-      bef = round(meta.info.batch_size * meta.info.experts_per_tok * safety_factor)  # batch * expert_per_token * safety factor
+      # TODO(rdyro): check that (total_recv_size / x.shape[0] * experts_per_token) < safety_factor
+
+      # batch * expert_per_token * safety factor
+      bef = round(meta.info.batch_size * meta.info.experts_per_tok * safety_factor)
       bef = ((bef + SPARSECORE_PAD_SIZE - 1) // SPARSECORE_PAD_SIZE) * SPARSECORE_PAD_SIZE
+
       buffer = jax.lax.empty((bef,) + x.shape[1:], dtype=x.dtype)
       y = ragged_all_to_all(x_sort, buffer, *dataclasses.astuple(meta.preamble), axis_name=axis_name)
 

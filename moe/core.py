@@ -23,6 +23,7 @@ SPARSECORE_PAD_SIZE = 1024
 
 GathersType = Literal["builtin", "custom", "custom_sc"]
 
+
 class MoEInfo(NamedTuple):
   batch_size: int
   experts_per_tok: int

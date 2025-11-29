@@ -29,11 +29,13 @@ class SparseCoreTest(parameterized.TestCase):
     except (RuntimeError, ValueError):
       self.devices = None
 
-  @parameterized.product(align_lanes=[True, False], m=[4 * 17 * 256, 4096 * 8], k=[1024, 2048, 4096, 7168], m_mult=[1, 1.5, 2])
+  @parameterized.product(
+      align_lanes=[True, False], m=[4 * 17 * 256, 4096 * 8], k=[1024, 2048, 4096, 7168], m_mult=[1, 1.5, 2]
+  )
   def test_sc_gather(self, align_lanes, m, k, m_mult):
     if self.devices is None:
       self.skipTest("Sparse core not supported")
-    #m = 4096 * 8
+    # m = 4096 * 8
     m_final = ((round(m_mult * m) + 128 - 1) // 128) * 128
 
     x = random_normal(0, (m, k), "bfloat16")

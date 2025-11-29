@@ -163,7 +163,7 @@ nonunique_sc_gather.defvjp(nonunique_sc_gather_fwd, nonunique_sc_gather_bwd)
 @partial(jax.custom_vjp, nondiff_argnames=("ad_mode", "empty_for_scatter"))
 def unique_sc_gather(x: jax.Array, idx: jax.Array, inv_idx: jax.Array, ad_mode: str, empty_for_scatter: bool = True):
   assert ad_mode in ("gather", "scatter")
-  #return x[idx, ...]
+  # return x[idx, ...]
   return sc_gather(x, idx)
 
 
@@ -217,10 +217,7 @@ def sc_gather(x, idx, window: int | None = None):
   )
   def _gather(idx_vmem, scratch1_ref, scratch2_ref, sems):
     core_id, subcore_id = jax.lax.axis_index("core"), jax.lax.axis_index("subcore")
-    try:
-      assert idx_ref.shape[0] % (window * num_subcores * num_cores) == 0
-    except:
-      a = 1
+    assert idx_ref.shape[0] % (window * num_subcores * num_cores) == 0
     subcore_slice = idx_ref.shape[0] // (num_subcores * num_cores)
     offset = (core_id * num_subcores + subcore_id) * subcore_slice
 
