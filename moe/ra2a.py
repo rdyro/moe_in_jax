@@ -138,10 +138,6 @@ def _ra2a_3d_kernel_async(
     copy = pltpu.make_async_copy(src, dst, sems.at[0, sem_id, 1])
     return RDMACopy(copy, copy.start, copy.wait)
 
-  dma_copy = make_dma(idx)
-  if start:
-    dma_copy.start()
-
   def make_rdma(other_id, send: bool = True):
     src_id, dst_id = (idx, other_id) if send else (other_id, idx)
     size = lax.select(idx == src_id, send_sizes[dst_id], recv_sizes[src_id])
@@ -155,6 +151,8 @@ def _ra2a_3d_kernel_async(
     wait_fn = copy.wait_send if send else copy.wait_recv
     return RDMACopy(copy, start_fn, wait_fn)
 
+  dma_copy = make_dma(idx)
+
   send_rdmas, recv_rdmas = [], []
   for i in range(1, n_devices):
     other_id = jax.lax.rem(idx + i, n_devices)
@@ -163,6 +161,7 @@ def _ra2a_3d_kernel_async(
 
   if start:
     [rdma.start() for rdma in (send_rdmas + recv_rdmas)]
+    dma_copy.start()
   else:
     [rdma.wait() for rdma in (send_rdmas + recv_rdmas)]
     dma_copy.wait()
@@ -187,10 +186,11 @@ def make_ra2a_3d(axis_name: str = "x"):
       input_output_aliases={1: 0},
       interpret=False,
     )(src, output, input_offsets, send_sizes, output_offsets, recv_sizes)
-    return out, sems
+    future = (src, out, sems, input_offsets, send_sizes, output_offsets, recv_sizes)
+    return future
 
-  def wait(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, future):
-    sems = future
+  def wait(future):
+    src, output, sems, input_offsets, send_sizes, output_offsets, recv_sizes = future
 
     def ra2a_kernel_wait(src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, sems, dst_ref):
       return _ra2a_3d_kernel_async(
@@ -198,7 +198,6 @@ def make_ra2a_3d(axis_name: str = "x"):
         axis_name=axis_name, start=False
       )
 
-    # sems_spec = pltpu.SemaphoreType.DMA((n_devices, 2, 2))
     out = pl.pallas_call(
       ra2a_kernel_wait,
       out_shape=output,
@@ -213,6 +212,40 @@ def make_ra2a_3d(axis_name: str = "x"):
 
   return start, wait
 
+########################################################################################################################
+
+
+@partial(jax.custom_vjp, nondiff_argnames=("axis_name",))
+def ra2a_split(extra_input, src, output, input_offsets, send_sizes, output_offsets, recv_sizes, axis_name: str):
+  _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name)
+  future = _start_fn(src, output, input_offsets, send_sizes, output_offsets, recv_sizes)
+  extra_input, future = jax.lax.optimization_barrier((extra_input, future))
+  out = _wait_fn(future)
+  return extra_input, out
+
+
+def ra2a_split_fwd(extra_input, src, output, input_offsets, send_sizes, output_offsets, recv_sizes, axis_name: str):
+  meta = (input_offsets, send_sizes, output_offsets, recv_sizes, src.shape)
+  return ra2a_split(extra_input, src, output, input_offsets, send_sizes, output_offsets, recv_sizes, axis_name), meta
+
+
+def ra2a_split_bwd(axis_name: str, res, g):
+  (input_offsets, send_sizes, output_offsets, recv_sizes, src_shape) = res
+  dextra_input, dout = g
+
+  inv_send_sizes, inv_recv_sizes = recv_sizes, send_sizes
+  inv_input_offsets = jax.lax.all_to_all(output_offsets, axis_name, split_axis=0, concat_axis=0)
+  inv_output_offsets = jax.lax.all_to_all(input_offsets, axis_name, split_axis=0, concat_axis=0)
+
+  buf = jax.lax.empty(src_shape, dtype=dout.dtype)
+  _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name)
+  future = _start_fn(dout, buf, inv_input_offsets, inv_send_sizes, inv_output_offsets, inv_recv_sizes)
+  dextra_input, future = jax.lax.optimization_barrier((dextra_input, future))
+  dout = _wait_fn(future)
+  return (dextra_input, dout, *[None for _ in range(1 + 4)])
+
+
+ra2a_split.defvjp(ra2a_split_fwd, ra2a_split_bwd)
 
 # synchronous ra2a 3D kernel ###########################################################################################
 

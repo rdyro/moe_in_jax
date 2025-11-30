@@ -50,6 +50,11 @@ def ra2a_sc(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, 
   input_offsets_ref, send_sizes_ref, output_offsets_ref, recv_sizes_ref = jax.tree.map(
       jax.new_ref, (input_offsets, send_sizes, output_offsets, recv_sizes)
   )
+  cost_estimate = pl.CostEstimate(
+    flops=0, transcendentals=0,
+    bytes_accessed=2 * (src.size * src.itemsize),
+    remote_bytes_transferred=src.size * src.itemsize,
+  )
 
   @pl.kernel(
       out_shape=(),
@@ -61,6 +66,7 @@ def ra2a_sc(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, 
           pltpu.SMEM((2 * n_devices,), jnp.int32),
           pltpu.SemaphoreType.DMA((n_devices, 2, 2)),
       ),
+      cost_estimate=cost_estimate,
   )
   def _ra2a_2d_kernel_sync(input_offsets, send_sizes, output_offsets, recv_sizes, sems):
     # core_id, subcore_id = jax.lax.axis_index("core"), jax.lax.axis_index("subcore")

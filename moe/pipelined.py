@@ -9,6 +9,8 @@ from .utils import RA2AMeta, add_indices, compute_padded_group_gather, unique_ga
 from .core import RaggedAllToCallCallable, SENTINEL_VALUE, MoEMeta, MoEInfo, GathersType, SPARSECORE_PAD_SIZE
 from . import sc_kernels as sc
 
+from .ra2a import make_ra2a_3d
+
 
 @register_jax_dataclass(meta_fields=["compute_meta", "load_fn", "compute_fn", "unload_fn"])
 @dataclasses.dataclass
@@ -104,80 +106,136 @@ def create_moe(
   ######################################################################################################################
   # compute ############################################################################################################
   ######################################################################################################################
+  _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name)
 
-  def load_fn(x: jax.Array, meta: MoEMeta):
-    assert meta.info.batch_size == x.shape[0], f"Expected {meta.info.batch_size=}, but got {x.shape[0]=}."
+  # def load_fn(x: jax.Array, meta: MoEMeta):
+  def load_fn():
+    # assert meta.info.batch_size == x.shape[0], f"Expected {meta.info.batch_size=}, but got {x.shape[0]=}."
+    # # step 1: gather local tokens for every expert per token
+    # with jax.named_scope("tokens_to_experts_gather"):
+    #   if gathers == "custom":
+    #     x_sort = jnp.repeat(x, experts_per_tok, axis=0)
+    #     x_sort = unique_gather(x_sort, meta.local_ra2a_sort, meta.local_ra2a_isort, ad_mode="gather")
+    #   elif gathers == "custom_sc":
+    #     x_sort = jnp.repeat(x, experts_per_tok, axis=0)
+    #     x_sort = sc.unique_sc_gather(x_sort, meta.local_ra2a_sort, meta.local_ra2a_isort, ad_mode="gather")
+    #   else:
+    #     x_sort = x[meta.local_ra2a_sort // experts_per_tok, ...]
 
-    # step 1: gather local tokens for every expert per token
-    with jax.named_scope("tokens_to_experts_gather"):
-      if gathers == "custom":
-        x_sort = jnp.repeat(x, experts_per_tok, axis=0)
-        x_sort = unique_gather(x_sort, meta.local_ra2a_sort, meta.local_ra2a_isort, ad_mode="gather")
-      elif gathers == "custom_sc":
-        x_sort = jnp.repeat(x, experts_per_tok, axis=0)
-        x_sort = sc.unique_sc_gather(x_sort, meta.local_ra2a_sort, meta.local_ra2a_isort, ad_mode="gather")
-      else:
-        x_sort = x[meta.local_ra2a_sort // experts_per_tok, ...]
+    # # step 2: communicate expert-gathered-tokens to their corresponding expert shards
+    # with jax.named_scope("ra2a_tokens"):
+    #   total_recv_size = jnp.sum(meta.preamble.recv_sizes)
+    #   # TODO(rdyro): check that (total_recv_size / x.shape[0] * experts_per_token) < safety_factor
 
-    # step 2: communicate expert-gathered-tokens to their corresponding expert shards
-    with jax.named_scope("ra2a_tokens"):
-      total_recv_size = jnp.sum(meta.preamble.recv_sizes)
-      # TODO(rdyro): check that (total_recv_size / x.shape[0] * experts_per_token) < safety_factor
+    #   # batch * expert_per_token * safety factor
+    #   bef = round(meta.info.batch_size * meta.info.experts_per_tok * safety_factor)
+    #   bef = ((bef + SPARSECORE_PAD_SIZE - 1) // SPARSECORE_PAD_SIZE) * SPARSECORE_PAD_SIZE
 
-      # batch * expert_per_token * safety factor
-      bef = round(meta.info.batch_size * meta.info.experts_per_tok * safety_factor)
-      bef = ((bef + SPARSECORE_PAD_SIZE - 1) // SPARSECORE_PAD_SIZE) * SPARSECORE_PAD_SIZE
+    #   buffer = jax.lax.empty((bef,) + x.shape[1:], dtype=x.dtype)
+    #   y = ragged_all_to_all(x_sort, buffer, *dataclasses.astuple(meta.preamble), axis_name=axis_name)
 
-      buffer = jax.lax.empty((bef,) + x.shape[1:], dtype=x.dtype)
-      y = ragged_all_to_all(x_sort, buffer, *dataclasses.astuple(meta.preamble), axis_name=axis_name)
+    # # step 3: gather tokens locally so they're expert-contiguous
+    # with jax.named_scope("local_gather_before"):
+    #   if gathers == "custom":
+    #     y = unique_gather(y, meta.local_permute.sort_idx, meta.local_permute.isort_idx, ad_mode="gather")
+    #   elif gathers == "custom_sc":
+    #     y = sc.unique_sc_gather(y, meta.local_permute.sort_idx, meta.local_permute.isort_idx, ad_mode="gather")
+    #   else:
+    #     y = y[meta.local_permute.sort_idx, ...]
+    # #return y
 
-    # step 3: gather tokens locally so they're expert-contiguous
-    with jax.named_scope("local_gather_before"):
-      if gathers == "custom":
-        y = unique_gather(y, meta.local_permute.sort_idx, meta.local_permute.isort_idx, ad_mode="gather")
-      elif gathers == "custom_sc":
-        y = sc.unique_sc_gather(y, meta.local_permute.sort_idx, meta.local_permute.isort_idx, ad_mode="gather")
-      else:
-        y = y[meta.local_permute.sort_idx, ...]
-    return y
+    def start_fn(x, meta):
 
-  def compute_fn(y: jax.Array, meta: MoEMeta):
+      # step 1: gather local tokens for every expert per token
+      with jax.named_scope("tokens_to_experts_gather"):
+        if gathers == "custom":
+          x_sort = jnp.repeat(x, experts_per_tok, axis=0)
+          x_sort = unique_gather(x_sort, meta.local_ra2a_sort, meta.local_ra2a_isort, ad_mode="gather")
+        elif gathers == "custom_sc":
+          x_sort = jnp.repeat(x, experts_per_tok, axis=0)
+          x_sort = sc.unique_sc_gather(x_sort, meta.local_ra2a_sort, meta.local_ra2a_isort, ad_mode="gather")
+        else:
+          x_sort = x[meta.local_ra2a_sort // experts_per_tok, ...]
+
+      # step 2: communicate expert-gathered-tokens to their corresponding expert shards
+      with jax.named_scope("ra2a_tokens"):
+        total_recv_size = jnp.sum(meta.preamble.recv_sizes)
+        # TODO(rdyro): check that (total_recv_size / x.shape[0] * experts_per_token) < safety_factor
+
+        # batch * expert_per_token * safety factor
+        bef = round(meta.info.batch_size * meta.info.experts_per_tok * safety_factor)
+        bef = ((bef + SPARSECORE_PAD_SIZE - 1) // SPARSECORE_PAD_SIZE) * SPARSECORE_PAD_SIZE
+
+        buffer = jax.lax.empty((bef,) + x.shape[1:], dtype=x.dtype)
+        # y = ragged_all_to_all(x_sort, buffer, *dataclasses.astuple(meta.preamble), axis_name=axis_name)
+        # out, sems = _start_fn(x_sort, buffer, *dataclasses.astuple(meta.preamble))
+        future = _start_fn(x_sort, buffer, *dataclasses.astuple(meta.preamble))
+
+      # return (x_sort, out, sems)
+      return future
+
+    # def wait_fn(out, meta):
+    def wait_fn(future, meta):
+      # step 3: gather tokens locally so they're expert-contiguous
+      # x_sort, out, sems = out
+      # y = wait_fn(x_sort, out, *dataclasses.astuple(meta.preamble), sems)
+      y = _wait_fn(future)
+
+      with jax.named_scope("local_gather_before"):
+        if gathers == "custom":
+          y = unique_gather(y, meta.local_permute.sort_idx, meta.local_permute.isort_idx, ad_mode="gather")
+        elif gathers == "custom_sc":
+          y = sc.unique_sc_gather(y, meta.local_permute.sort_idx, meta.local_permute.isort_idx, ad_mode="gather")
+        else:
+          y = y[meta.local_permute.sort_idx, ...]
+      return y
+
+    return start_fn, wait_fn
+
+  def compute_fn(y: jax.Array, meta: MoEMeta, *args):
     # step 4: perform gmm computation
     local_group_counts = meta.local_permute.group_counts_with_padding
     with jax.named_scope("compute"):
       if compute_block is not None:
-        y = compute_block(y, local_group_counts)
+        y = compute_block(y, local_group_counts, *args)
     return y
 
-  def unload_fn(y: jax.Array, meta: MoEMeta):
-    # step 5: unpermute tokens locally to organize them into chunks in which they arrived
-    with jax.named_scope("local_gather_after"):
-      if gathers == "custom":
-        y = unique_gather(y, meta.local_permute.isort_idx, meta.local_permute.isort_idx, ad_mode="scatter")
-      elif gathers == "custom_sc":
-        y = sc.unique_sc_gather(y, meta.local_permute.isort_idx, meta.local_permute.isort_idx, ad_mode="scatter")
-      else:
-        y = y[meta.local_permute.isort_idx, ...]
+  # def unload_fn(y: jax.Array, meta: MoEMeta):
+  def unload_fn():
+    def start_fn(y: jax.Array, meta: MoEMeta):
+      # step 5: unpermute tokens locally to organize them into chunks in which they arrived
+      with jax.named_scope("local_gather_after"):
+        if gathers == "custom":
+          y = unique_gather(y, meta.local_permute.isort_idx, meta.local_permute.isort_idx, ad_mode="scatter")
+        elif gathers == "custom_sc":
+          y = sc.unique_sc_gather(y, meta.local_permute.isort_idx, meta.local_permute.isort_idx, ad_mode="scatter")
+        else:
+          y = y[meta.local_permute.isort_idx, ...]
 
-    # step 6: communincate the chunks back to their origins
-    with jax.named_scope("ra2a_results"):
-      out = jax.lax.empty((meta.info.batch_size * meta.info.experts_per_tok, *y.shape[1:]), dtype=y.dtype)
-      x_sort = ragged_all_to_all(y, out, *dataclasses.astuple(meta.epilogue), axis_name=axis_name)
+      # step 6: communincate the chunks back to their origins
+      with jax.named_scope("ra2a_results"):
+        out = jax.lax.empty((meta.info.batch_size * meta.info.experts_per_tok, *y.shape[1:]), dtype=y.dtype)
+        # x_sort = ragged_all_to_all(y, out, *dataclasses.astuple(meta.epilogue), axis_name=axis_name)
+        future = _start_fn(y, out, *dataclasses.astuple(meta.epilogue))
+      return future
 
-    # step 7: gather so each token repeats are next to each other
-    with jax.named_scope("expert_to_tokens_gather"):
-      if gathers == "custom":
-        y = unique_gather(x_sort, meta.local_ra2a_isort, meta.local_ra2a_isort, ad_mode="scatter")
-      elif gathers == "custom_sc":
-        y = sc.unique_sc_gather(x_sort, meta.local_ra2a_isort, meta.local_ra2a_isort, ad_mode="scatter")
-      else:
-        y = x_sort[meta.local_ra2a_isort, ...]
+    def wait_fn(future, meta: MoEMeta):
+      x_sort = _wait_fn(future)
+      # step 7: gather so each token repeats are next to each other
+      with jax.named_scope("expert_to_tokens_gather"):
+        if gathers == "custom":
+          y = unique_gather(x_sort, meta.local_ra2a_isort, meta.local_ra2a_isort, ad_mode="scatter")
+        elif gathers == "custom_sc":
+          y = sc.unique_sc_gather(x_sort, meta.local_ra2a_isort, meta.local_ra2a_isort, ad_mode="scatter")
+        else:
+          y = x_sort[meta.local_ra2a_isort, ...]
 
-    # step 8: weigh by expert weights
-    with jax.named_scope("reduction_across_experts"):
-      y = y.reshape((meta.info.batch_size, experts_per_tok) + y.shape[1:])
-      y = jnp.sum(y, axis=1)
+      # step 8: weigh by expert weights
+      with jax.named_scope("reduction_across_experts"):
+        y = y.reshape((meta.info.batch_size, experts_per_tok) + y.shape[1:])
+        y = jnp.sum(y, axis=1)
 
-    return y
+      return y
+    return start_fn, wait_fn
 
   return MoEMethods(compute_meta, load_fn, compute_fn, unload_fn)

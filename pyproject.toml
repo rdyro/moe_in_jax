@@ -41,9 +41,15 @@ ignore = [
     "E741",  # allow ambiguous names
 ]
 select = ["B9", "C", "F", "W", "YTT", "ASYNC", "E"]
+
 [tool.ruff.lint.per-file-ignores]
 "*.ipynb" = [
     "W391",  # ignore too-many-newlines-at-end-of-file
     "E501",  # ignore line-too-long
     "E265",  # ignore no-space-after-block-comment
+]
+
+[[tool.ty.overrides]]
+exclude = [
+    "moe/megablox/*",
 ]
