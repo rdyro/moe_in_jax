@@ -43,16 +43,16 @@ class MoEMeta:
 
 def run_moe(
     x: jax.Array, all_idxs: jax.Array,
+    *extra_args,
     compute_block: Callable[[jax.Array, jax.Array | None], jax.Array] | None = None,
     ragged_all_to_all: RaggedAllToCallCallable = jax.lax.ragged_all_to_all,
-    *,
     axis_name: str, experts_num: int, safety_factor: float = 1.2, multiple: int = 1, gathers: GathersType = "builtin",
 ):
 
   out_specs = P(axis_name, *[None for _ in range(x.ndim - 1)])
 
   @partial(jax.shard_map, out_specs=out_specs, check_vma=False)
-  def fn(x: jax.Array, all_idxs: jax.Array):
+  def fn(x: jax.Array, all_idxs: jax.Array, *extra_args):
     shard_idx, num_shards = jax.lax.axis_index(axis_name), jax.lax.axis_size(axis_name)
     experts_per_shard = experts_num // num_shards
     experts_per_tok = all_idxs.size // x.shape[0] // num_shards  # because all_idxs is replicated
@@ -170,7 +170,7 @@ def run_moe(
     with jax.named_scope("compute"):
       if compute_block is not None:
         # y = compute_block(y, local_group_counts)
-        y = compute_block(y, meta.local_permute.group_counts_with_padding)
+        y = compute_block(y, meta.local_permute.group_counts_with_padding, *extra_args)
 
     # step 5: unpermute tokens locally to organize them into chunks in which they arrived
     with jax.named_scope("local_gather_after"):
@@ -202,7 +202,7 @@ def run_moe(
 
     return y
 
-  return fn(x, all_idxs)
+  return fn(x, all_idxs, *extra_args)
 
 
 def run_moe_ag(
