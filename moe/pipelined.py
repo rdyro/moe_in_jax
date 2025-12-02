@@ -133,6 +133,8 @@ def create_moe(
       buffer = jax.lax.empty((bef,) + x.shape[1:], dtype=x.dtype)
       # y = ragged_all_to_all(x_sort, buffer, *dataclasses.astuple(meta.preamble), axis_name=axis_name)
       extra_input, y = ra2a_split(extra_input, x_sort, buffer, *dataclasses.astuple(meta.preamble), axis_name=axis_name)
+      # _, y = ra2a_split(2, x_sort, buffer, *dataclasses.astuple(meta.preamble), axis_name=axis_name)
+      print("hello")
 
     # step 3: gather tokens locally so they're expert-contiguous
     with jax.named_scope("local_gather_before"):
@@ -168,6 +170,7 @@ def create_moe(
       out = jax.lax.empty((meta.info.batch_size * meta.info.experts_per_tok, *y.shape[1:]), dtype=y.dtype)
       # x_sort = ragged_all_to_all(y, out, *dataclasses.astuple(meta.epilogue), axis_name=axis_name)
       extra_input, x_sort = ra2a_split(extra_input, y, out, *dataclasses.astuple(meta.epilogue), axis_name=axis_name)
+      # _, x_sort = ra2a_split(2, y, out, *dataclasses.astuple(meta.epilogue), axis_name=axis_name)
 
     # step 7: gather so each token repeats are next to each other
     with jax.named_scope("expert_to_tokens_gather"):

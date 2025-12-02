@@ -327,9 +327,9 @@ def ra2a_split_bwd(axis_name: str, res, g):
   buf = jax.lax.empty(src_shape, dtype=dout.dtype)
   _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name)
   future = _start_fn(dout, buf, inv_input_offsets, inv_send_sizes, inv_output_offsets, inv_recv_sizes)
-  dextra_input, future = jax.lax.optimization_barrier((dextra_input, future))
+  # dextra_input, future = jax.lax.optimization_barrier((dextra_input, future))
   dout = _wait_fn(future)
-  print("new2")
+  print("new8")
   # dextra_input, dout = jax.lax.optimization_barrier((dextra_input, dout))
   return (dextra_input, dout, *[None for _ in range(1 + 4)])
 
@@ -339,10 +339,9 @@ ra2a_split.defvjp(ra2a_split_fwd, ra2a_split_bwd)
 ########################################################################################################################
 
 
-def make_split_ra2a(compute_fn):
+def make_split_ra2a(compute_fn, compute_vjp_fn=None):
 
-  @partial(jax.custom_vjp, nondiff_argnames=("axis_name",))
-  def ra2a_split(payloads, args, axis_name: str):
+  def _ra2a_split(payloads, args, axis_name: str):
     print("fn", jax.tree.map(jax.typeof, (payloads, args)))
     _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name)
 
@@ -356,8 +355,14 @@ def make_split_ra2a(compute_fn):
       futures.append(future)
 
     args, futures = jax.lax.optimization_barrier((args, futures))
-    y = compute_fn(*args) if compute_fn is not None else None
+    # y = compute_fn(*args) if compute_fn is not None else None
+    if compute_fn is not None:
+      y, vjp_fn = jax.vjp(compute_fn, *args)
+    else:
+      y = None
+      vjp_fn = None
     y, futures = jax.lax.optimization_barrier((y, futures))
+    print("overlapping fwd")
 
     outs = []
     for future in futures:
@@ -371,16 +376,25 @@ def make_split_ra2a(compute_fn):
     # ]
 
     print(jax.tree.map(jax.typeof, (outs, y)))
-    return outs, y
+    return (outs, y), vjp_fn
+
+  @partial(jax.custom_vjp, nondiff_argnames=("axis_name",))
+  def ra2a_split(payloads, args, axis_name: str):
+    return _ra2a_split(payloads, args, axis_name)[0]
 
   def ra2a_split_fwd(payloads, args, axis_name: str):
     print("fwd", jax.tree.map(jax.typeof, (payloads, args)))
-    res = ([[payload[0].shape] + list(payload[2:]) if payload is not None else None for payload in payloads], args)
-    return ra2a_split(payloads, args, axis_name), res
+    ret, vjp_fn = _ra2a_split(payloads, args, axis_name)
+    res = (
+        [[payload[0].shape] + list(payload[2:]) if payload is not None else None for payload in payloads],
+        args,
+        vjp_fn
+    )
+    return ret, res
 
   def ra2a_split_bwd(axis_name: str, res, g):
     _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name)
-    payloads, args = res
+    payloads, args, vjp_fn = res
     tangents = g[0]
 
     futures = []
@@ -396,10 +410,14 @@ def make_split_ra2a(compute_fn):
         future = None
       futures.append(future)
 
-    print("overlapping bwd")
-    args, futures = jax.lax.optimization_barrier((args, futures))
+    g1, futures = jax.lax.optimization_barrier((g[1], futures))
     if compute_fn is not None:
-      dcompute = jax.vjp(compute_fn, *args)[1](g[1])
+      if compute_vjp_fn is not None:
+        dcompute = compute_vjp_fn(g1)
+      else:
+        # dcompute = jax.vjp(compute_fn, *args)[1](g[1])
+        # dcompute = jax.grad(lambda args: jnp.sum(g[1] * compute_fn(*args)), allow_int=True)(args)
+        dcompute = vjp_fn(g1)
     else:
       dcompute = jax.tree.map(lambda _: None, args)
     dcompute, futures = jax.lax.optimization_barrier((dcompute, futures))
