@@ -215,7 +215,6 @@ def make_ra2a_3d(axis_name: str = "x"):
 ########################################################################################################################
 
 
-@partial(jax.custom_vjp, nondiff_argnames=("axis_name",))
 def start_ra2a(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, axis_name: str):
   n_devices = jax.lax.axis_size(axis_name)
 
@@ -238,27 +237,6 @@ def start_ra2a(src, output, input_offsets, send_sizes, output_offsets, recv_size
   return future
 
 
-def start_ra2a_fwd(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, axis_name: str):
-  res = (input_offsets, send_sizes, output_offsets, recv_sizes)
-  return start_ra2a(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, axis_name), res
-
-
-def start_ra2a_bwd(axis_name: str, res, g):
-  (input_offsets, send_sizes, output_offsets, recv_sizes) = res
-  input_offsets, send_sizes, output_offsets, recv_sizes, buf_shape = res
-  inv_send_sizes, inv_recv_sizes = recv_sizes, send_sizes
-  inv_input_offsets = jax.lax.all_to_all(output_offsets, axis_name, split_axis=0, concat_axis=0)
-  inv_output_offsets = jax.lax.all_to_all(input_offsets, axis_name, split_axis=0, concat_axis=0)
-  dsrc = g[0]
-  return (dsrc, *[None for _ in range(1 + 4)])
-
-
-start_ra2a.defvjp(start_ra2a_fwd, start_ra2a_bwd)
-
-####
-
-
-@partial(jax.custom_vjp, nondiff_argnames=("axis_name",))
 def wait_ra2a(future, axis_name: str):
   src, output, sems, input_offsets, send_sizes, output_offsets, recv_sizes = future
 
@@ -280,66 +258,10 @@ def wait_ra2a(future, axis_name: str):
   )(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, sems)
   return out
 
-
-def wait_ra2a_fwd(future, axis_name: str):
-  res = (*future[3:], future[1].shape)
-  return wait_ra2a(future, axis_name), res
-
-
-def wait_ra2a_bwd(axis_name: str, res, g):
-  input_offsets, send_sizes, output_offsets, recv_sizes, buf_shape = res
-  inv_send_sizes, inv_recv_sizes = recv_sizes, send_sizes
-  inv_input_offsets = jax.lax.all_to_all(output_offsets, axis_name, split_axis=0, concat_axis=0)
-  inv_output_offsets = jax.lax.all_to_all(input_offsets, axis_name, split_axis=0, concat_axis=0)
-  dout = g[0]
-  buffer = jax.lax.empty(buf_shape, dtype=dout.dtype)
-  gs = start_ra2a(dout, buffer, inv_input_offsets, inv_send_sizes, inv_output_offsets, inv_recv_sizes, axis_name)[:2]
-  return list(gs) + [None] * 4
-
-
-wait_ra2a.defvjp(wait_ra2a_fwd, wait_ra2a_bwd)
-
 ########################################################################################################################
 
 
-@partial(jax.custom_vjp, nondiff_argnames=("axis_name",))
-def ra2a_split(extra_input, src, output, input_offsets, send_sizes, output_offsets, recv_sizes, axis_name: str):
-  _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name)
-  future = _start_fn(src, output, input_offsets, send_sizes, output_offsets, recv_sizes)
-  extra_input, future = jax.lax.optimization_barrier((extra_input, future))
-  out = _wait_fn(future)
-  return extra_input, out
-
-
-def ra2a_split_fwd(extra_input, src, output, input_offsets, send_sizes, output_offsets, recv_sizes, axis_name: str):
-  meta = (input_offsets, send_sizes, output_offsets, recv_sizes, src.shape)
-  return ra2a_split(extra_input, src, output, input_offsets, send_sizes, output_offsets, recv_sizes, axis_name), meta
-
-
-def ra2a_split_bwd(axis_name: str, res, g):
-  (input_offsets, send_sizes, output_offsets, recv_sizes, src_shape) = res
-  dextra_input, dout = g
-
-  inv_send_sizes, inv_recv_sizes = recv_sizes, send_sizes
-  inv_input_offsets = jax.lax.all_to_all(output_offsets, axis_name, split_axis=0, concat_axis=0)
-  inv_output_offsets = jax.lax.all_to_all(input_offsets, axis_name, split_axis=0, concat_axis=0)
-
-  buf = jax.lax.empty(src_shape, dtype=dout.dtype)
-  _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name)
-  future = _start_fn(dout, buf, inv_input_offsets, inv_send_sizes, inv_output_offsets, inv_recv_sizes)
-  # dextra_input, future = jax.lax.optimization_barrier((dextra_input, future))
-  dout = _wait_fn(future)
-  print("new8")
-  # dextra_input, dout = jax.lax.optimization_barrier((dextra_input, dout))
-  return (dextra_input, dout, *[None for _ in range(1 + 4)])
-
-
-ra2a_split.defvjp(ra2a_split_fwd, ra2a_split_bwd)
-
-########################################################################################################################
-
-
-def make_split_ra2a(compute_fn, compute_vjp_fn=None):
+def make_split_ra2a(compute_fn):
 
   def _ra2a_split(payloads, args, axis_name: str):
     print("fn", jax.tree.map(jax.typeof, (payloads, args)))
@@ -355,14 +277,8 @@ def make_split_ra2a(compute_fn, compute_vjp_fn=None):
       futures.append(future)
 
     args, futures = jax.lax.optimization_barrier((args, futures))
-    # y = compute_fn(*args) if compute_fn is not None else None
-    if compute_fn is not None:
-      y, vjp_fn = jax.vjp(compute_fn, *args)
-    else:
-      y = None
-      vjp_fn = None
+    (y, vjp_fn) = jax.vjp(compute_fn, *args) if compute_fn is not None else (None, None)
     y, futures = jax.lax.optimization_barrier((y, futures))
-    print("overlapping fwd")
 
     outs = []
     for future in futures:
@@ -411,15 +327,7 @@ def make_split_ra2a(compute_fn, compute_vjp_fn=None):
       futures.append(future)
 
     g1, futures = jax.lax.optimization_barrier((g[1], futures))
-    if compute_fn is not None:
-      if compute_vjp_fn is not None:
-        dcompute = compute_vjp_fn(g1)
-      else:
-        # dcompute = jax.vjp(compute_fn, *args)[1](g[1])
-        # dcompute = jax.grad(lambda args: jnp.sum(g[1] * compute_fn(*args)), allow_int=True)(args)
-        dcompute = vjp_fn(g1)
-    else:
-      dcompute = jax.tree.map(lambda _: None, args)
+    dcompute = vjp_fn(g1) if compute_fn is not None else jax.tree.map(lambda _: None, args)
     dcompute, futures = jax.lax.optimization_barrier((dcompute, futures))
 
     douts = []

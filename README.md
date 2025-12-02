@@ -18,7 +18,13 @@ each.
 
 This is an attractive strategy because it's very simple.
 
-$$ \text{AG} \rightarrow \text{gather} \rightarrow \text{compute} \rightarrow \text{scatter-add} \rightarrow \text{RS} $$
+$$ \underset{\text{RS}}{\text{AG}} \rightarrow \underset{\text{scatter-add}}{\text{gather}} \rightarrow \underset{\text{compute}}{\text{compute}} \rightarrow \underset{\text{gather}}{\text{scatter-add}} \rightarrow \underset{\text{AG}}{\text{RS}} $$
+
+An alternative strategy replaces the gather with broadcast + gather and the scatter-add with gather + sum.
+
+$$ \underset{\text{RS}}{\text{AG}} \rightarrow \underset{\text{sum}}{\text{broadcast}} \rightarrow \underset{\text{gather}}{\text{gather}}
+\rightarrow \underset{\text{compute}}{\text{compute}} \rightarrow \underset{\text{gather}}{\text{gather}} \rightarrow \underset{\text{broadcast}}{\text{sum}}
+\rightarrow \underset{\text{AG}}{\text{RS}} $$
 
 The total communication required is
   - $B E$ for the all-gather
@@ -30,7 +36,7 @@ The total HBM bandwidth required is:
 
 #### Ragged all-to-all necessary tokens
 
-$$ \text{gather} \rightarrow \text{RA2A} \rightarrow \text{gather} \rightarrow \text{compute} \rightarrow \text{scatter-add} \rightarrow \text{RA2A} \rightarrow \text{scatter-add} $$
+$$ \underset{\text{scatter-add}}{\text{gather}} \rightarrow \underset{\text{RA2A}}{\text{RA2A}} \rightarrow \underset{\text{scatter-add}}{\text{gather}} \rightarrow \underset{\text{compute}}{\text{compute}} \rightarrow \underset{\text{gather}}{\text{scatter-add}} \rightarrow \underset{\text{RA2A}}{\text{RA2A}} \rightarrow \underset{\text{gather}}{\text{scatter-add}} $$
 
 The probability that a shard needs a token is
 
@@ -56,7 +62,11 @@ The total HBM bandwidth required is
 
 #### Ragged all-to-all after routing
 
-$$ \text{broadcast} \rightarrow \text{gather} \rightarrow \text{RA2A} \rightarrow \text{gather} \rightarrow \text{compute} \rightarrow \text{gather} \rightarrow \text{RA2A} \rightarrow \text{gather} \rightarrow \text{sum} $$
+$$ \underset{\text{sum}}{\text{broadcast}} \rightarrow \underset{\text{gather}}{\text{gather}}
+\rightarrow \underset{\text{RA2A}}{\text{RA2A}} \rightarrow \underset{\text{gather}}{\text{gather}}
+\rightarrow \text{compute}
+\rightarrow \underset{\text{gather}}{\text{gather}} \rightarrow \underset{\text{RA2A}}{\text{RA2A}}
+\rightarrow \underset{\text{gather}}{\text{gather}} \rightarrow \underset{\text{broadcast}}{\text{sum}} $$
 
 The total communinication required is:
   - RA2A to send $k \frac{B}{N}$

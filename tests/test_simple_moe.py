@@ -1,3 +1,4 @@
+import dataclasses
 from functools import partial
 
 from absl.testing import absltest
@@ -7,7 +8,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 import numpy as np
 
-from moe.core import run_moe, add_indices
+from moe.core import run_moe, add_indices, MoEConfig
 from moe.ra2a_simulator import ragged_all_to_all as ra2a_via_ag
 from .utils import generate_data
 
@@ -24,11 +25,12 @@ random_randint = lambda key, shape, minval, maxval: jnp.array(np.random.default_
 
 class MoeTest(parameterized.TestCase):
   @parameterized.product(
-      # TODO(rdyro): figure out why multiple = 8 doesn't work here (in fwd pass wrt reference, not o1 vs o2)
-      # experts_per_tok=[1, 2, 4], device=["cpu", "tpu", "cuda"], multiple=[1, 2, 8], with_compute=[True, False]
-      experts_per_tok=[1, 2, 4], device=["cpu", "tpu", "cuda"], multiple=[1], with_compute=[True, False]
+      experts_per_tok=[1, 2, 4], device=["cpu", "tpu", "cuda"], multiple=[1, 2, 8],
+      ra2a=[ra2a_via_ag, jax.lax.ragged_all_to_all]
   )
-  def test_unique_gather_derivative(self, experts_per_tok, device, multiple, with_compute):
+  def test_unique_gather_derivative(self, experts_per_tok, device, multiple, ra2a):
+    if device == "cpu" and ra2a != ra2a_via_ag:
+      self.skipTest("No jax.lax.ragged_all_to_all on CPU")
     try:
       devices = jax.devices(device)
     except RuntimeError:
@@ -52,11 +54,13 @@ class MoeTest(parameterized.TestCase):
         weights = jnp.sum(((iota >= starts[None, :]) & (iota < ends[None, :])) * group_idxs[None, :], -1)
         return y * jnp.expand_dims(weights, tuple(range(1, y.ndim)))
 
-      opts = dict(axis_name="x", experts_num=g, ragged_all_to_all=ra2a_via_ag, multiple=multiple, compute_block=compute)
-      moe1_fn = jax.jit(partial(run_moe, **opts, gathers="builtin"))
-      moe2_fn = jax.jit(partial(run_moe, **opts, gathers="custom"))
-      o1, vjp1_fn = jax.vjp(partial(moe1_fn, all_idxs=all_idxs), x)
-      o2, vjp2_fn = jax.vjp(partial(moe2_fn, all_idxs=all_idxs), x)
+      # config = MoEConfig(multiple=multiple, ra2a=ra2a_via_ag)
+      config = MoEConfig(multiple=multiple, ra2a=ra2a)
+      opts = dict(axis_name="x", experts_per_tok=experts_per_tok, experts_num=g, compute_block=compute)
+      moe1_fn = jax.jit(partial(run_moe, **opts, config=dataclasses.replace(config, gathers="builtin")))
+      moe2_fn = jax.jit(partial(run_moe, **opts, config=dataclasses.replace(config, gathers="custom")))
+      o1, vjp1_fn = jax.vjp(partial(moe1_fn, all_idxs), x)
+      o2, vjp2_fn = jax.vjp(partial(moe2_fn, all_idxs), x)
 
       # np.testing.assert_allclose(x, x_new)
       x_ref = jnp.repeat(x, experts_per_tok, axis=0, out_sharding=P(axis_name, None))
@@ -88,7 +92,8 @@ class MoeTest(parameterized.TestCase):
       x = jax.random.normal(jax.random.key(0), (n, k), dtype="bfloat16")
       all_idxs = jax.random.randint(jax.random.key(0), (experts_per_tok * x.shape[0],), minval=0, maxval=g)
       x, all_idxs = jax.device_put(x, P(axis_name, None)), jax.device_put(all_idxs, P(None))
-      out = run_moe(x, all_idxs, axis_name="x", experts_num=g, ragged_all_to_all=ra2a_via_ag)
+      out = run_moe(all_idxs, x, axis_name="x", experts_per_tok=experts_per_tok, experts_num=g,
+                    config=MoEConfig(ra2a=ra2a_via_ag))
       out = out / experts_per_tok
       self.assertEqual(out.shape, (n, x.shape[-1]))
 
@@ -116,10 +121,11 @@ class MoeTest(parameterized.TestCase):
       all_idxs = jax.random.randint(jax.random.key(0), experts_per_tok * m, minval=0, maxval=g)
       x, ra2a_meta = generate_data(m, k, device_num=len(devices), axis_name=axis_name)
       del ra2a_meta
-      moe_fn = jax.jit(partial(
-          run_moe, axis_name=axis_name, experts_num=g, multiple=multiple, ragged_all_to_all=ra2a_via_ag
-      ))
-      out = moe_fn(x, all_idxs) / experts_per_tok
+      config = MoEConfig(multiple=multiple, ra2a=ra2a_via_ag)
+      moe_fn = jax.jit(
+        partial(run_moe, axis_name=axis_name, experts_per_tok=experts_per_tok, experts_num=g, config=config)
+      )
+      out = moe_fn(all_idxs, x) / experts_per_tok
       self.assertEqual(out.shape, (m, x.shape[-1]))
       np.testing.assert_allclose(x, out, rtol=1e-5)
 

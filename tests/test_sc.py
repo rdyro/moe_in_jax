@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import jax.experimental.pallas.tpu as pltpu
 import numpy as np
 
-from moe.sc_kernels import sc_gather, sc_scatter
+from moe.sc_kernels import sc_gather, sc_scatter, SPARSECORE_PAD_SIZE
 
 random_normal = lambda key, shape, dtype: jnp.array(np.random.default_rng(key).normal(size=shape)).astype(dtype)
 random_randint = lambda key, shape, minval, maxval: jnp.array(np.random.default_rng(key).integers(
@@ -35,8 +35,7 @@ class SparseCoreTest(parameterized.TestCase):
   def test_sc_gather(self, align_lanes, m, k, m_mult):
     if self.devices is None:
       self.skipTest("Sparse core not supported")
-    # m = 4096 * 8
-    m_final = ((round(m_mult * m) + 128 - 1) // 128) * 128
+    m_final = ((round(m_mult * m) + SPARSECORE_PAD_SIZE - 1) // SPARSECORE_PAD_SIZE) * SPARSECORE_PAD_SIZE
 
     x = random_normal(0, (m, k), "bfloat16")
     all_idxs = jnp.argsort(random_normal(0, (m_final,), "bfloat16")) % m
@@ -51,7 +50,7 @@ class SparseCoreTest(parameterized.TestCase):
     if self.devices is None:
       self.skipTest("Sparse core not supported")
     m = 4096 * 8
-    m_final = ((round(m_mult * m) + 128 - 1) // 128) * 128
+    m_final = ((round(m_mult * m) + SPARSECORE_PAD_SIZE - 1) // SPARSECORE_PAD_SIZE) * SPARSECORE_PAD_SIZE
 
     x = random_normal(0, (m, k), "bfloat16")
     all_idxs = jnp.argsort(random_normal(0, (m_final,), "bfloat16"))[:m]
