@@ -2,7 +2,6 @@ import dataclasses
 import os
 from functools import partial
 import gc
-import time
 
 os.environ["LIBTPU_INIT_ARGS"] = " ".join([
     "--xla_tpu_enable_offloading_gather_to_sparsecore=true",
@@ -10,6 +9,8 @@ os.environ["LIBTPU_INIT_ARGS"] = " ".join([
     "--xla_tpu_offload_all_supported_gathers_to_sparsecore=true",
     "--xla_tpu_offload_gather_to_sparsecore=true",
     "--xla_tpu_offload_all_supported_gathers_to_sparsecore=true",
+    # "--xla_tpu_enable_async_ragged_all_to_all=true",
+    # "--xla_tpu_enable_sparse_core_collective_offload_ragged_all_to_all=true",
 ])
 # os.environ["XLA_FLAGS"] = "--xla_gpu_enable_command_buffer=''"  # let named_scopes show up on GPU
 
@@ -71,6 +72,8 @@ def main(devices):
   experts_per_tok = 8
   embed = 7168
   x_shape = (m, 8, embed // 8)
+  # x_shape = (m, embed // 128, 128)
+  # x_shape = (m, embed)
   multiple = 1
 
   keys = iter(jax.random.split(jax.random.key(0), 1024))
@@ -88,14 +91,13 @@ def main(devices):
   # config = moe.core.MoEConfig(ra2a=partial(moe.ra2a.ra2a, multiple=multiple), multiple=multiple)
 
   opts = dict(axis_name="x", experts_per_tok=experts_per_tok, experts_num=g, compute_block=compute_block)
-  config2 = dataclasses.replace(config, gathers="custom")
+  config2 = dataclasses.replace(config, ra2a=jax.lax.ragged_all_to_all, gathers="custom")
+  config3 = dataclasses.replace(config2, ra2a=None)  # to allow selecting the split ra2a on TPU
   run_moe = partial(moe.core.run_moe, **opts, config=config)
   run_moe2 = partial(moe.core.run_moe, **opts, config=config2)
-  run_moe3 = partial(moe.pipelined.run_moe_pipelined, **opts, config=config2, splits=4)
+  run_moe3 = partial(moe.pipelined.run_moe_pipelined, **opts, config=config3, splits=4)
 
   def make_jit(run_moe_fn):
-    # return jax.jit(lambda *args: jnp.sum(run_moe_fn(*args), tuple(range(1, x.ndim))),
-    #               in_shardings=(P(), *[P(axis_name)] * 4))
     return jax.jit(run_moe_fn, in_shardings=(P(), *[P(axis_name)] * 4))
 
   run_moe_jit = make_jit(run_moe)
@@ -120,14 +122,16 @@ def main(devices):
   y2 = jax.block_until_ready(run_moe2_jit(all_idxs, x, *extra_args))
   y3 = jax.block_until_ready(run_moe3_jit(all_idxs, x, *extra_args))
 
-  (_, do1) = jax.block_until_ready(vjp_jit(all_idxs, x, r, *extra_args))
-  (_, do2) = jax.block_until_ready(vjp2_jit(all_idxs, x, r, *extra_args))
-  (_, do3) = jax.block_until_ready(vjp3_jit(all_idxs, x, r, *extra_args))
-
   y_err = jnp.sum(jnp.abs(y1 - y2) != 0)
   y_err3 = jnp.sum(jnp.abs(y1 - y3) != 0)
   print(f"y_err =  {jax.tree.map(float, y_err)}")
   print(f"y_err3 = {jax.tree.map(float, y_err3)}")
+  del y_err, y_err3, y1, y2, y3
+  [gc.collect() for _ in range(3)]
+
+  (_, do1) = jax.block_until_ready(vjp_jit(all_idxs, x, r, *extra_args))
+  (_, do2) = jax.block_until_ready(vjp2_jit(all_idxs, x, r, *extra_args))
+  (_, do3) = jax.block_until_ready(vjp3_jit(all_idxs, x, r, *extra_args))
 
   error_fn = lambda x, y: jnp.linalg.norm(x - y, axis=tuple(range(1, x.ndim))) / jnp.maximum(
     jnp.linalg.norm(y, axis=tuple(range(1, y.ndim))), 1e-7
@@ -136,7 +140,7 @@ def main(devices):
   do_err3 = jax.tree.map(jnp.max, jax.tree.map(error_fn, do1, do3))
   print(f"do_err =  {jax.tree.map(float, do_err)}")
   print(f"do_err3 = {jax.tree.map(float, do_err3)}")
-  del y_err, y_err3, do1, do2, do3, y1, y2, y3, do_err, do_err3
+  del do1, do2, do3, do_err, do_err3
   [gc.collect() for _ in range(3)]
 
   with moe.utils.profile():
@@ -156,6 +160,7 @@ def main(devices):
   print("#" * 80)
   print("#" * 80)
   print("#" * 80)
+  breakpoint()
 
 
 if __name__ == "__main__":
@@ -164,8 +169,3 @@ if __name__ == "__main__":
   mesh = jax.make_mesh((len(devices),), (axis_name,), axis_types=jax.sharding.AxisType.Explicit, devices=devices)
   with jax.sharding.set_mesh(mesh):
     main(devices)
-  try:
-    while True:
-      time.sleep(10)
-  except KeyboardInterrupt:
-    pass

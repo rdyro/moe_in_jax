@@ -21,6 +21,7 @@ repos:
   - id: debug-statements
     # only include python files
     files: \.py$
+    exclude: tests/benchmark.py
   - id: trailing-whitespace
     # only include python files
     files: \.py$

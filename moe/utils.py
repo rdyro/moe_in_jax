@@ -4,14 +4,12 @@ import os
 from functools import partial
 from pathlib import Path
 from subprocess import Popen
-from typing import Any, TypeVar, Callable
+from typing import Any, Callable, TypeVar
 
 import jax
-import jax.experimental.pallas as pl
+import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
-from jax.sharding import Sharding
 import psutil
-
 
 zip_ = zip
 zip = partial(zip_, strict=True)
@@ -42,28 +40,11 @@ class RA2AMeta:
   recv_sizes: jax.Array
 
 
-def empty(shape, dtype, out_sharding=None):
-  """Create an empty array with the given shape and dtype, and the given sharding."""
-  if out_sharding is None:
-    out_shape, out_specs = jax.ShapeDtypeStruct(shape, dtype), pl.BlockSpec(memory_space=pl.ANY)
-    return pl.pallas_call(lambda *args: None, out_shape=out_shape, out_specs=out_specs)()
-
-  spec = out_sharding.spec if isinstance(out_sharding, Sharding) else out_sharding
-  assert len(spec) <= len(shape)
-  shard_axes = tuple(spec) + (None,) * (len(shape) - len(spec))
-
-  if isinstance(out_sharding, Sharding):
-    decorator = partial(jax.shard_map, mesh=out_sharding.mesh, out_specs=out_sharding.spec, check_vma=False)
-  else:
-    decorator = partial(jax.shard_map, out_specs=out_sharding, check_vma=False)
-
-  @decorator
-  def _():
-    local_shape = [(s // jax.lax.axis_size(a)) if a is not None else s for s, a in zip(shape, shard_axes)]
-    out_shape, out_specs = jax.ShapeDtypeStruct(local_shape, dtype), pl.BlockSpec(memory_space=pl.ANY)
-    return pl.pallas_call(lambda *args: None, out_shape=out_shape, out_specs=out_specs)()
-
-  return _()
+def tpu_sublane_size():
+  try:
+    return pltpu.get_tpu_info().num_sublanes
+  except ValueError:  # we don't have TPU
+    return 1
 
 
 @partial(jax.jit, static_argnames=("pad_size",))

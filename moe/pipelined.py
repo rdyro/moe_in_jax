@@ -1,4 +1,5 @@
 import dataclasses
+import warnings
 from functools import partial
 from typing import Callable
 
@@ -6,11 +7,11 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from .utils import RA2AMeta, add_indices, compute_padded_group_gather, unique_gather, register_jax_dataclass
-from .core import SENTINEL_VALUE, MoEMeta, MoEInfo, MoEConfig, maybe_pad_size
 from . import sc_kernels as sc
-
+from .core import SENTINEL_VALUE, MoEConfig, MoEInfo, MoEMeta, maybe_pad_size, RA2A_SHAPE_SAFE_FNS
 from .ra2a import make_split_ra2a
+from .utils import (RA2AMeta, add_indices, compute_padded_group_gather,
+                    register_jax_dataclass, unique_gather, tpu_sublane_size)
 
 
 @register_jax_dataclass(meta_fields=["compute_meta", "load_fn", "compute_fn", "unload_fn"])
@@ -97,7 +98,7 @@ def _create_pipelined_moe(
       # compute the local permutation
       local_expert_idxs_ = jnp.where(local_pack_mask, local_expert_idxs - shard_idx * experts_per_shard, SENTINEL_VALUE)
       local_group_counts = jnp.sum(all_sizes.reshape((num_shards, num_shards, experts_per_shard))[:, shard_idx, :], 0)
-      local_permute = compute_padded_group_gather(local_expert_idxs_, experts_per_shard, multiple=config.multiple,
+      local_permute = compute_padded_group_gather(local_expert_idxs_, experts_per_shard, multiple=1,
                                                   group_counts=local_group_counts)
       local_group_counts = local_permute.group_counts_with_padding
 
@@ -110,7 +111,7 @@ def _create_pipelined_moe(
 
   def load_fn():
     def prepare_fn(x, meta: MoEMeta):
-      assert meta.info.batch_size == x.shape[0], f"Expected {meta.info.batch_size=}, but got {x.shape[0]=}."
+      # assert meta.info.batch_size == x.shape[0], f"Expected {meta.info.batch_size=}, but got {x.shape[0]=}."
       # step 1: gather local tokens for every expert per token
       with jax.named_scope("tokens_to_experts_gather"):
         if config.gathers == "custom":
@@ -190,7 +191,8 @@ def _create_pipelined_moe(
 
       # step 8: weigh by expert weights
       with jax.named_scope("reduction_across_experts"):
-        y = y.reshape((meta.info.batch_size, experts_per_tok) + y.shape[1:])
+        # y = y.reshape((meta.info.batch_size, experts_per_tok) + y.shape[1:])
+        y = y.reshape((y.shape[0] // experts_per_tok, experts_per_tok) + y.shape[1:])
         y = jnp.sum(y, axis=1)
       return y
     return prepare_fn, finalize_fn
@@ -200,7 +202,10 @@ def _create_pipelined_moe(
 
 ########################################################################################################################
 
-def _overlap_fn(y1, y2, meta1, meta2, meta3, x_next, *extra_args, axis_name: str, moe_methods, i, splits):
+def _overlap_fn(
+    y1, y2, meta1, meta2, meta3, x_next, *extra_args,
+    axis_name: str, moe_methods: MoEMethods, i: int, splits: int, config: MoEConfig,
+):
   """A function to overlap communication with the communication block."""
   fut1, fut3, y1_next, y3_next = None, None, None, None
   if 0 <= i < splits:
@@ -213,7 +218,8 @@ def _overlap_fn(y1, y2, meta1, meta2, meta3, x_next, *extra_args, axis_name: str
     fut3 = prepare_fn3(y2, meta3)
     # fut3 = tuple(fut3) + dataclasses.astuple(meta3.epilogue)
 
-  ra2a_split = make_split_ra2a(moe_methods.compute_fn if 1 <= i < splits + 1 else None)
+  ra2a_split = make_split_ra2a(moe_methods.compute_fn if 1 <= i < splits + 1 else None, multiple=config.multiple,
+                               ra2a=config.ra2a)
 
   (y1_next, y3_next), y2_next = ra2a_split((fut1, fut3), (y1, meta2, *extra_args), axis_name=axis_name)
 
@@ -229,6 +235,13 @@ def run_moe_pipelined_shard_map(
     compute_block: Callable[[jax.Array, jax.Array | None], jax.Array] | None = None,
     axis_name: str, experts_per_tok: int, experts_num: int, config: MoEConfig = MoEConfig(), splits: int = 1,
 ):
+  assert x.ndim >= 2, f"Tokens must be at least 2D, but got x = {jax.typeof(x)}"
+  if x.ndim < 3 and config.multiple != 1:
+    warnings.warn("Padding groups for a 2D ra2a is not currently well tested, proceed at your own risk.")
+  if x.ndim == 2 and config.multiple % tpu_sublane_size() and config.ra2a not in RA2A_SHAPE_SAFE_FNS:
+    raise ValueError("You're attempting to ragged-all-to-all a 2D tensor via a pallas call that exploits the assumption"
+                     f" that send chunks are aligned to sublanes, but {config.multiple=} and {tpu_sublane_size()=}.")
+
   moe_methods = _create_pipelined_moe(
     compute_block, axis_name=axis_name, experts_per_tok=experts_per_tok, experts_num=experts_num, config=config
   )
@@ -243,7 +256,7 @@ def run_moe_pipelined_shard_map(
   x_next = x_[0, ...]
   y1s, y2s, y3s = [], [], []
   for i in range(splits + 2):
-    overlap_fn_ = partial(_overlap_fn, moe_methods=moe_methods, i=i, splits=splits, axis_name=axis_name)
+    overlap_fn_ = partial(_overlap_fn, moe_methods=moe_methods, i=i, splits=splits, axis_name=axis_name, config=config)
 
     meta1 = all_metas[i] if 0 <= i < splits else 0
     y1, meta2 = (y1s[i - 1], all_metas[i - 1]) if 1 <= i < splits + 1 else (None, None)

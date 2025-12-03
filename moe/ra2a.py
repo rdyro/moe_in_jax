@@ -20,7 +20,7 @@ class RDMACopy:
 
 # synchronous ra2a 2D kernel ###########################################################################################
 
-multiple_of = lambda a, b: (a // b) * b
+multiple_of = lambda a, multiple: (a // multiple) * multiple
 
 
 def _ra2a_2d_kernel_sync(src_ref,
@@ -127,22 +127,25 @@ def _ra2a_3d_kernel_async(
   *,
   axis_name: str,
   start: bool = True,
+  multiple: int = 1,
 ):
   del out_ref  # aliased in dst_ref
   idx, n_devices = jax.lax.axis_index(axis_name), jax.lax.axis_size(axis_name)
 
+  _multiple_of = partial(multiple_of, multiple=multiple)
+
   def make_dma(id):
     sem_id = lax.rem(idx + idx, n_devices)
-    src = src_ref.at[pl.ds(input_offsets[id], send_sizes[id]), ...]
-    dst = dst_ref.at[pl.ds(output_offsets[id], send_sizes[id]), ...]
+    src = src_ref.at[pl.ds(_multiple_of(input_offsets[id]), _multiple_of(send_sizes[id])), ...]
+    dst = dst_ref.at[pl.ds(_multiple_of(output_offsets[id]), _multiple_of(send_sizes[id])), ...]
     copy = pltpu.make_async_copy(src, dst, sems.at[0, sem_id, 1])
     return RDMACopy(copy, copy.start, copy.wait)
 
   def make_rdma(other_id, send: bool = True):
     src_id, dst_id = (idx, other_id) if send else (other_id, idx)
     size = lax.select(idx == src_id, send_sizes[dst_id], recv_sizes[src_id])
-    src = src_ref.at[pl.ds(input_offsets[dst_id], size), ...]
-    dst = dst_ref.at[pl.ds(output_offsets[dst_id], size), ...]
+    src = src_ref.at[pl.ds(_multiple_of(input_offsets[dst_id]), _multiple_of(size)), ...]
+    dst = dst_ref.at[pl.ds(_multiple_of(output_offsets[dst_id]), _multiple_of(size)), ...]
     sem_id, direction_id = lax.rem(idx + other_id, n_devices), (src_id > dst_id).astype(jnp.int32)
     send_sem = sems.at[sem_id, direction_id, 0]
     recv_sem = sems.at[sem_id, direction_id, 1]
@@ -167,14 +170,14 @@ def _ra2a_3d_kernel_async(
     dma_copy.wait()
 
 
-def make_ra2a_3d(axis_name: str = "x"):
+def make_ra2a_3d(axis_name: str = "x", multiple: int = 1):
   def start(src, output, input_offsets, send_sizes, output_offsets, recv_sizes):
     n_devices = jax.lax.axis_size(axis_name)
 
     def ra2a_kernel_start(src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems):
       return _ra2a_3d_kernel_async(
         src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems,
-        axis_name=axis_name, start=True,
+        axis_name=axis_name, multiple=multiple, start=True
       )
 
     sems_spec = pltpu.SemaphoreType.DMA((n_devices, 2, 2))
@@ -195,7 +198,7 @@ def make_ra2a_3d(axis_name: str = "x"):
     def ra2a_kernel_wait(src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, sems, dst_ref):
       return _ra2a_3d_kernel_async(
         src_ref, out_ref, input_offsets, send_sizes, output_offsets, recv_sizes, dst_ref, sems,
-        axis_name=axis_name, start=False
+        axis_name=axis_name, multiple=multiple, start=False
       )
 
     out = pl.pallas_call(
@@ -261,17 +264,18 @@ def wait_ra2a(future, axis_name: str):
 ########################################################################################################################
 
 
-def make_split_ra2a(compute_fn):
+def make_split_ra2a(compute_fn, multiple: int = 1, ra2a: Callable | None = None):
 
   def _ra2a_split(payloads, args, axis_name: str):
-    print("fn", jax.tree.map(jax.typeof, (payloads, args)))
-    _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name)
-
     futures = []
+    _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name, multiple=multiple)
     for payload in payloads:
       if payload is not None:
         (src, output, input_offsets, send_sizes, output_offsets, recv_sizes) = payload
-        future = _start_fn(src, output, input_offsets, send_sizes, output_offsets, recv_sizes)
+        if ra2a is None:
+          future = _start_fn(src, output, input_offsets, send_sizes, output_offsets, recv_sizes)
+        else:
+          future = ra2a(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, axis_name=axis_name)
       else:
         future = None
       futures.append(future)
@@ -282,16 +286,12 @@ def make_split_ra2a(compute_fn):
 
     outs = []
     for future in futures:
-      out = _wait_fn(future) if future is not None else None
+      if ra2a is None:
+        out = _wait_fn(future) if future is not None else None
+      else:
+        out = future
       outs.append(out)
 
-    # outs = [
-    #   jax.lax.ragged_all_to_all(src, output, input_offsets, send_sizes, output_offsets, recv_sizes,
-    #                             axis_name=axis_name)
-    #   for (src, output, input_offsets, send_sizes, output_offsets, recv_sizes) in payloads
-    # ]
-
-    print(jax.tree.map(jax.typeof, (outs, y)))
     return (outs, y), vjp_fn
 
   @partial(jax.custom_vjp, nondiff_argnames=("axis_name",))
@@ -299,7 +299,6 @@ def make_split_ra2a(compute_fn):
     return _ra2a_split(payloads, args, axis_name)[0]
 
   def ra2a_split_fwd(payloads, args, axis_name: str):
-    print("fwd", jax.tree.map(jax.typeof, (payloads, args)))
     ret, vjp_fn = _ra2a_split(payloads, args, axis_name)
     res = (
         [[payload[0].shape] + list(payload[2:]) if payload is not None else None for payload in payloads],
@@ -309,7 +308,7 @@ def make_split_ra2a(compute_fn):
     return ret, res
 
   def ra2a_split_bwd(axis_name: str, res, g):
-    _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name)
+    _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name, multiple=multiple)
     payloads, args, vjp_fn = res
     tangents = g[0]
 
@@ -321,19 +320,27 @@ def make_split_ra2a(compute_fn):
         inv_input_offsets = jax.lax.all_to_all(output_offsets, axis_name, split_axis=0, concat_axis=0)
         inv_output_offsets = jax.lax.all_to_all(input_offsets, axis_name, split_axis=0, concat_axis=0)
         buf = jax.lax.empty(src_shape, dtype=tangent.dtype)
-        future = _start_fn(tangent, buf, inv_input_offsets, inv_send_sizes, inv_output_offsets, inv_recv_sizes)
+        if ra2a is None:
+          future = _start_fn(tangent, buf, inv_input_offsets, inv_send_sizes, inv_output_offsets, inv_recv_sizes)
+        else:
+          future = ra2a(tangent, buf, inv_input_offsets, inv_send_sizes, inv_output_offsets, inv_recv_sizes,
+                        axis_name=axis_name)
       else:
         future = None
       futures.append(future)
 
-    g1, futures = jax.lax.optimization_barrier((g[1], futures))
+    g1 = g[1]
+    g1, futures = jax.lax.optimization_barrier((g1, futures))
     dcompute = vjp_fn(g1) if compute_fn is not None else jax.tree.map(lambda _: None, args)
     dcompute, futures = jax.lax.optimization_barrier((dcompute, futures))
 
     douts = []
     for future in futures:
       if future is not None:
-        dout = _wait_fn(future)
+        if ra2a is None:
+          dout = _wait_fn(future)
+        else:
+          dout = future
         douts.append(tuple([dout] + [None] * 5))
       else:
         douts.append(None)

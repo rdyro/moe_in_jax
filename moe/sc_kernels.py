@@ -1,8 +1,8 @@
-import math
 import dataclasses
-from functools import partial
+import math
 import os
-from typing import Literal, Callable, Any
+from functools import partial
+from typing import Any, Callable, Literal
 
 LIBTPU_INIT_ARGS = os.environ.get("LIBTPU_INIT_ARGS", "").split(" ")
 os.environ["LIBTPU_INIT_ARGS"] = " ".join([
@@ -10,11 +10,11 @@ os.environ["LIBTPU_INIT_ARGS"] = " ".join([
 ] + LIBTPU_INIT_ARGS)
 
 import jax  # noqa: E402
-from jax import lax  # noqa: E402
-import jax.numpy as jnp  # noqa: E402
 import jax.experimental.pallas as pl  # noqa: E402
 import jax.experimental.pallas.tpu as pltpu  # noqa: E402
 import jax.experimental.pallas.tpu_sc as plsc  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+from jax import lax  # noqa: E402
 from jax.experimental.compute_on import compute_on  # noqa: E402
 
 ########################################################################################################################

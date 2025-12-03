@@ -1,1 +1,2 @@
-from .kernels import gmm as gmm, tgmm as tgmm
+from .kernels import gmm as gmm
+from .kernels import tgmm as tgmm

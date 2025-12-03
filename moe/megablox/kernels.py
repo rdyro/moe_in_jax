@@ -16,19 +16,18 @@
 
 # pylint: disable=too-many-positional-arguments, unnecessary-lambda-assignment
 
-from collections.abc import Callable
 import functools
 import json
 import math
+from collections.abc import Callable
 
 import jax
+import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-import jax.numpy as jnp
 
-from . import utils
-from . import quantization
+from . import quantization, utils
 
 zip_ = zip
 zip = functools.partial(zip_, strict=True)

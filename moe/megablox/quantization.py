@@ -14,9 +14,9 @@
 # ==============================================================================
 """`QuantizedArray` class."""
 
-from functools import partial
-from collections.abc import Callable, Sequence
 import dataclasses
+from collections.abc import Callable, Sequence
+from functools import partial
 
 import jax
 import jax.numpy as jnp

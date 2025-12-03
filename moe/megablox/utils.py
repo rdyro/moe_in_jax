@@ -21,10 +21,9 @@ from typing import Any, Callable, Final, Sequence
 import jax
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
-from jax.extend import backend
 import jax.numpy as jnp
 import qwix
-
+from jax.extend import backend
 
 zip_ = zip
 zip = functools.partial(zip_, strict=True)
