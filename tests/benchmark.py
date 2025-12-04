@@ -4,11 +4,11 @@ from functools import partial
 import gc
 
 os.environ["LIBTPU_INIT_ARGS"] = " ".join([
-    "--xla_tpu_enable_offloading_gather_to_sparsecore=true",
-    "--xla_tpu_enable_offloading_scatter_to_sparsecore=true",
-    "--xla_tpu_offload_all_supported_gathers_to_sparsecore=true",
-    "--xla_tpu_offload_gather_to_sparsecore=true",
-    "--xla_tpu_offload_all_supported_gathers_to_sparsecore=true",
+    # "--xla_tpu_enable_offloading_gather_to_sparsecore=true",
+    # "--xla_tpu_enable_offloading_scatter_to_sparsecore=true",
+    # "--xla_tpu_offload_all_supported_gathers_to_sparsecore=true",
+    # "--xla_tpu_offload_gather_to_sparsecore=true",
+    # "--xla_tpu_offload_all_supported_gathers_to_sparsecore=true",
     # "--xla_tpu_enable_async_ragged_all_to_all=true",
     # "--xla_tpu_enable_sparse_core_collective_offload_ragged_all_to_all=true",
 ])
@@ -164,6 +164,7 @@ def main(devices):
 
 
 if __name__ == "__main__":
+  # devices = jax.devices()
   devices = jax.devices()
   axis_name = "x"
   mesh = jax.make_mesh((len(devices),), (axis_name,), axis_types=jax.sharding.AxisType.Explicit, devices=devices)

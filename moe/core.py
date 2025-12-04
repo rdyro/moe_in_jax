@@ -173,20 +173,23 @@ def run_moe_shard_map(
       x_sort = x[meta.local_ra2a_sort // experts_per_tok, ...]
 
   # step 2: communicate expert-gathered-tokens to their corresponding expert shards
-  with jax.named_scope("ra2a_tokens"):
-    total_recv_size = jnp.sum(recv_sizes)
-    # check that (total_recv_size / x.shape[0] * experts_per_token) < safety_factor
-    buffer = jax.lax.empty((buffer_size,) + x.shape[1:], dtype=x.dtype)
-    y = config.ra2a(x_sort, buffer, *dataclasses.astuple(meta.preamble), axis_name=axis_name)
+  if num_shards == 1:  # short-circuit ra2a
+    y = x_sort
+  else:
+    with jax.named_scope("ra2a_tokens"):
+      total_recv_size = jnp.sum(recv_sizes)
+      # check that (total_recv_size / x.shape[0] * experts_per_token) < safety_factor
+      buffer = jax.lax.empty((buffer_size,) + x.shape[1:], dtype=x.dtype)
+      y = config.ra2a(x_sort, buffer, *dataclasses.astuple(meta.preamble), axis_name=axis_name)
 
-  # step 3: gather tokens locally so they're expert-contiguous
-  with jax.named_scope("local_gather_before"):
-    if config.gathers == "custom":
-      y = unique_gather(y, meta.local_permute.sort_idx, meta.local_permute.isort_idx, ad_mode="gather")
-    elif config.gathers == "custom_sc":
-      y = sc.unique_sc_gather(y, meta.local_permute.sort_idx, meta.local_permute.isort_idx, ad_mode="gather")
-    else:
-      y = y[meta.local_permute.sort_idx, ...]
+    # step 3: gather tokens locally so they're expert-contiguous
+    with jax.named_scope("local_gather_before"):
+      if config.gathers == "custom":
+        y = unique_gather(y, meta.local_permute.sort_idx, meta.local_permute.isort_idx, ad_mode="gather")
+      elif config.gathers == "custom_sc":
+        y = sc.unique_sc_gather(y, meta.local_permute.sort_idx, meta.local_permute.isort_idx, ad_mode="gather")
+      else:
+        y = y[meta.local_permute.sort_idx, ...]
 
   # step 4: perform gmm computation
   with jax.named_scope("compute"):
@@ -194,19 +197,22 @@ def run_moe_shard_map(
       # y = compute_block(y, local_group_counts)
       y = compute_block(y, meta.local_permute.group_counts_with_padding, *extra_args)
 
-  # step 5: unpermute tokens locally to organize them into chunks in which they arrived
-  with jax.named_scope("local_gather_after"):
-    if config.gathers == "custom":
-      y = unique_gather(y, meta.local_permute.isort_idx, meta.local_permute.isort_idx, ad_mode="scatter")
-    elif config.gathers == "custom_sc":
-      y = sc.unique_sc_gather(y, meta.local_permute.isort_idx, meta.local_permute.isort_idx, ad_mode="scatter")
-    else:
-      y = y[meta.local_permute.isort_idx, ...]
+  if num_shards == 1:  # short-circuit ra2a
+    x_sort = y
+  else:
+    # step 5: unpermute tokens locally to organize them into chunks in which they arrived
+    with jax.named_scope("local_gather_after"):
+      if config.gathers == "custom":
+        y = unique_gather(y, meta.local_permute.isort_idx, meta.local_permute.isort_idx, ad_mode="scatter")
+      elif config.gathers == "custom_sc":
+        y = sc.unique_sc_gather(y, meta.local_permute.isort_idx, meta.local_permute.isort_idx, ad_mode="scatter")
+      else:
+        y = y[meta.local_permute.isort_idx, ...]
 
-  # step 6: communincate the chunks back to their origins
-  with jax.named_scope("ra2a_results"):
-    out = jax.lax.empty((all_idxs.shape[-1],) + x.shape[1:], dtype=x.dtype)
-    x_sort = config.ra2a(y, out, *dataclasses.astuple(meta.epilogue), axis_name=axis_name)
+    # step 6: communincate the chunks back to their origins
+    with jax.named_scope("ra2a_results"):
+      out = jax.lax.empty((all_idxs.shape[-1],) + x.shape[1:], dtype=x.dtype)
+      x_sort = config.ra2a(y, out, *dataclasses.astuple(meta.epilogue), axis_name=axis_name)
 
   # step 7: gather so each token repeats are next to each other
   with jax.named_scope("expert_to_tokens_gather"):

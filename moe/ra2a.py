@@ -264,18 +264,27 @@ def wait_ra2a(future, axis_name: str):
 ########################################################################################################################
 
 
-def make_split_ra2a(compute_fn, multiple: int = 1, ra2a: Callable | None = None):
+def make_split_ra2a(axis_name: str, compute_fn, multiple: int = 1, ra2a: Callable | None = None):
+  _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name, multiple=multiple)
 
-  def _ra2a_split(payloads, args, axis_name: str):
+  def start_fn(src, output, input_offsets, send_sizes, output_offsets, recv_sizes):
+    if output is None:  # short-circuit ra2a
+      return src
+    if ra2a is None:
+      return _start_fn(src, output, input_offsets, send_sizes, output_offsets, recv_sizes)
+    return ra2a(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, axis_name=axis_name)
+
+  def wait_fn(future):
+    if isinstance(future, jax.Array):  # not an actual future, already the ready result
+      return future
+    return _wait_fn(future)
+
+  def _ra2a_split(payloads, args):
     futures = []
-    _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name, multiple=multiple)
     for payload in payloads:
       if payload is not None:
         (src, output, input_offsets, send_sizes, output_offsets, recv_sizes) = payload
-        if ra2a is None:
-          future = _start_fn(src, output, input_offsets, send_sizes, output_offsets, recv_sizes)
-        else:
-          future = ra2a(src, output, input_offsets, send_sizes, output_offsets, recv_sizes, axis_name=axis_name)
+        future = start_fn(src, output, input_offsets, send_sizes, output_offsets, recv_sizes)
       else:
         future = None
       futures.append(future)
@@ -287,19 +296,19 @@ def make_split_ra2a(compute_fn, multiple: int = 1, ra2a: Callable | None = None)
     outs = []
     for future in futures:
       if ra2a is None:
-        out = _wait_fn(future) if future is not None else None
+        out = wait_fn(future) if future is not None else None
       else:
         out = future
       outs.append(out)
 
     return (outs, y), vjp_fn
 
-  @partial(jax.custom_vjp, nondiff_argnames=("axis_name",))
-  def ra2a_split(payloads, args, axis_name: str):
-    return _ra2a_split(payloads, args, axis_name)[0]
+  @jax.custom_vjp
+  def ra2a_split(payloads, args):
+    return _ra2a_split(payloads, args)[0]
 
-  def ra2a_split_fwd(payloads, args, axis_name: str):
-    ret, vjp_fn = _ra2a_split(payloads, args, axis_name)
+  def ra2a_split_fwd(payloads, args):
+    ret, vjp_fn = _ra2a_split(payloads, args)
     res = (
         [[payload[0].shape] + list(payload[2:]) if payload is not None else None for payload in payloads],
         args,
@@ -307,8 +316,7 @@ def make_split_ra2a(compute_fn, multiple: int = 1, ra2a: Callable | None = None)
     )
     return ret, res
 
-  def ra2a_split_bwd(axis_name: str, res, g):
-    _start_fn, _wait_fn = make_ra2a_3d(axis_name=axis_name, multiple=multiple)
+  def ra2a_split_bwd(res, g):
     payloads, args, vjp_fn = res
     tangents = g[0]
 
@@ -316,15 +324,14 @@ def make_split_ra2a(compute_fn, multiple: int = 1, ra2a: Callable | None = None)
     for tangent, payload in zip(tangents, payloads, strict=True):
       if payload is not None:
         (src_shape, input_offsets, send_sizes, output_offsets, recv_sizes) = payload
-        inv_send_sizes, inv_recv_sizes = recv_sizes, send_sizes
-        inv_input_offsets = jax.lax.all_to_all(output_offsets, axis_name, split_axis=0, concat_axis=0)
-        inv_output_offsets = jax.lax.all_to_all(input_offsets, axis_name, split_axis=0, concat_axis=0)
-        buf = jax.lax.empty(src_shape, dtype=tangent.dtype)
-        if ra2a is None:
-          future = _start_fn(tangent, buf, inv_input_offsets, inv_send_sizes, inv_output_offsets, inv_recv_sizes)
-        else:
-          future = ra2a(tangent, buf, inv_input_offsets, inv_send_sizes, inv_output_offsets, inv_recv_sizes,
-                        axis_name=axis_name)
+        if input_offsets is not None:
+          inv_send_sizes, inv_recv_sizes = recv_sizes, send_sizes
+          inv_input_offsets = jax.lax.all_to_all(output_offsets, axis_name=axis_name, split_axis=0, concat_axis=0)
+          inv_output_offsets = jax.lax.all_to_all(input_offsets, axis_name=axis_name, split_axis=0, concat_axis=0)
+          buf = jax.lax.empty(src_shape, dtype=tangent.dtype)
+        else:  # short-circuit ra2a
+          buf, inv_input_offsets, inv_send_sizes, inv_output_offsets, inv_recv_sizes = [None] * 5
+        future = start_fn(tangent, buf, inv_input_offsets, inv_send_sizes, inv_output_offsets, inv_recv_sizes)
       else:
         future = None
       futures.append(future)
@@ -337,10 +344,7 @@ def make_split_ra2a(compute_fn, multiple: int = 1, ra2a: Callable | None = None)
     douts = []
     for future in futures:
       if future is not None:
-        if ra2a is None:
-          dout = _wait_fn(future)
-        else:
-          dout = future
+        dout = wait_fn(future)
         douts.append(tuple([dout] + [None] * 5))
       else:
         douts.append(None)

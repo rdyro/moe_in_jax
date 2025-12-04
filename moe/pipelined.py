@@ -123,6 +123,9 @@ def _create_pipelined_moe(
         else:
           x_sort = x[meta.local_ra2a_sort // experts_per_tok, ...]
 
+      if jax.lax.axis_size(axis_name) == 1:  # short-circuit ra2a
+        return (x_sort, None, *[None for _ in dataclasses.astuple(meta.preamble)])
+
       # step 2: communicate expert-gathered-tokens to their corresponding expert shards
       with jax.named_scope("ra2a_tokens"):
         total_recv_size = jnp.sum(meta.preamble.recv_sizes)
@@ -139,6 +142,9 @@ def _create_pipelined_moe(
         return (x_sort, buffer, *dataclasses.astuple(meta.preamble))
 
     def finalize_fn(y, meta: MoEMeta):
+      if jax.lax.axis_size(axis_name) == 1:  # short-circuit ra2a
+        return y
+
       # y = _wait_fn(future)
       # step 3: gather tokens locally so they're expert-contiguous
       with jax.named_scope("local_gather_before"):
@@ -162,6 +168,9 @@ def _create_pipelined_moe(
 
   def unload_fn():
     def prepare_fn(y, meta: MoEMeta):
+      if jax.lax.axis_size(axis_name) == 1:  # short-circuit ra2a
+        return (y, None, *[None for _ in dataclasses.astuple(meta.preamble)])
+
       # step 5: unpermute tokens locally to organize them into chunks in which they arrived
       with jax.named_scope("local_gather_after"):
         if config.gathers == "custom":
@@ -211,17 +220,16 @@ def _overlap_fn(
   if 0 <= i < splits:
     prepare_fn1, finalize_fn1 = moe_methods.load_fn()
     fut1 = prepare_fn1(x_next, meta1)
-    # fut1 = tuple(fut1) + dataclasses.astuple(meta1.preamble)
 
   if 2 <= i < splits + 2:
     prepare_fn3, finalize_fn3 = moe_methods.unload_fn()
     fut3 = prepare_fn3(y2, meta3)
-    # fut3 = tuple(fut3) + dataclasses.astuple(meta3.epilogue)
 
-  ra2a_split = make_split_ra2a(moe_methods.compute_fn if 1 <= i < splits + 1 else None, multiple=config.multiple,
-                               ra2a=config.ra2a)
+  ra2a_split_fn = make_split_ra2a(
+    axis_name, moe_methods.compute_fn if 1 <= i < splits + 1 else None, multiple=config.multiple, ra2a=config.ra2a
+  )
 
-  (y1_next, y3_next), y2_next = ra2a_split((fut1, fut3), (y1, meta2, *extra_args), axis_name=axis_name)
+  (y1_next, y3_next), y2_next = ra2a_split_fn((fut1, fut3), (y1, meta2, *extra_args))
 
   y1_next = finalize_fn1(y1_next, meta1) if 0 <= i < splits else y1_next
   y3_next = finalize_fn3(y3_next, meta3) if 2 <= i < splits + 2 else y3_next

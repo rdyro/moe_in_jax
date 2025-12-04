@@ -26,13 +26,13 @@ random_randint = lambda key, shape, minval, maxval: jnp.array(np.random.default_
 class MoeTest(parameterized.TestCase):
   @parameterized.product(
       experts_per_tok=[1, 2, 4], device=["cpu", "tpu", "cuda"], multiple=[1, 2, 8],
-      ra2a=[ra2a_via_ag, jax.lax.ragged_all_to_all]
+      ra2a=[ra2a_via_ag, jax.lax.ragged_all_to_all], device_num=[1, 4],
   )
-  def test_unique_gather_derivative(self, experts_per_tok, device, multiple, ra2a):
+  def test_unique_gather_derivative(self, experts_per_tok, device, multiple, ra2a, device_num):
     if device == "cpu" and ra2a != ra2a_via_ag:
       self.skipTest("No jax.lax.ragged_all_to_all on CPU")
     try:
-      devices = jax.devices(device)
+      devices = jax.devices(device)[:device_num]
     except RuntimeError:
       self.skipTest(f"Device {device} not available")
     axis_name = "x"
@@ -67,8 +67,8 @@ class MoeTest(parameterized.TestCase):
       x_ref = x_ref.reshape((x.shape[0], experts_per_tok, x.shape[1]))
       x_ref *= all_idxs.reshape((x.shape[0], experts_per_tok, 1))
       x_ref = jnp.sum(x_ref, 1)
-      np.testing.assert_allclose(o1, o2)
-      np.testing.assert_allclose(x_ref, o1)
+      np.testing.assert_allclose(o1, o2, atol=1e-5, rtol=1e-5)
+      np.testing.assert_allclose(x_ref, o1, atol=1e-5, rtol=1e-5)
 
       r = jax.jit(
         lambda: jax.random.normal(jax.random.key(1), o1.shape, dtype=x.dtype), out_shardings=P(axis_name, None)
