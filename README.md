@@ -1,5 +1,7 @@
 # MoE in JAX
 
+*Work in progress!*
+
 ## Expert parallelism
 
 ### Alternatives for communicating tokens
@@ -80,7 +82,7 @@ The total HBM bandwidth required is
   - sum $\frac{B}{N} \left(k + 1\right)$
 
 <p align="center">
-  <img src="docs/sending_tokens_to_experts.svg" style="width: 100%; max-width: 600px" />
+  <img src="docs/sending_tokens_to_experts.png" style="width: 100%; max-width: 600px" />
 </p>
 
 ## The problem of individually addressable tokens
@@ -108,7 +110,7 @@ layout (this might not be true in general).
 ## The pipelining strategy
 
 <p align="center">
-<img src="docs/pipeline.svg" style="width: 100%; max-width: 900px" />
+<img src="docs/pipeline.png" style="width: 100%; max-width: 900px" />
 </p>
 
 While the pipelining strategy makes perfect sense when drawn like that, it's not
@@ -128,7 +130,7 @@ the input to the compute and the future returned from `ra2a_start`, then again
 to tie the output of the compute to the `future` passed into `ra2a_wait`.
 
 <p align="center">
-  <img src="docs/overlap_barriers.svg" style="width: 100%; max-width: 400px" />
+  <img src="docs/overlap_barriers.png" style="width: 100%; max-width: 400px" />
 </p>
 
 
