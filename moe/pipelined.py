@@ -287,9 +287,6 @@ def run_moe_pipelined(
     compute_block: Callable[[jax.Array, jax.Array | None], jax.Array] | None = None,
     axis_name: str, experts_per_tok: int, experts_num: int, config: MoEConfig = MoEConfig(), splits: int = 1,
 ):
-  # opts = dict(axis_name=axis_name, experts_per_tok=experts_per_tok, experts_num=g, gathers="custom")
-  # moe_methods = _create_moe(compute_block, **opts)
-
   extra_specs = jax.tree.map(lambda x: jax.typeof(x).sharding.spec, extra_args)
 
   fn = partial(
@@ -300,31 +297,98 @@ def run_moe_pipelined(
   fn = jax.shard_map(fn, in_specs=(P(), P(axis_name), *extra_specs), out_specs=P(axis_name), check_vma=False)
   return fn(all_idxs, x, *extra_args)
 
-  # def inner(x, all_idxs, *extra_args):
-  #  axis_size = jax.lax.axis_size(axis_name)
-  #  assert x.shape[0] % splits == 0
-  #  assert all_idxs.shape[0] % (splits * axis_size) == 0
+########################################################################################################################
+# AG version ###########################################################################################################
+########################################################################################################################
 
-  #  x_ = x.reshape((splits, x.shape[0] // splits, *x.shape[1:]))
-  #  all_idxs_ = all_idxs.reshape((axis_size, splits, all_idxs.size // (splits * axis_size)))
 
-  #  all_metas = [moe_methods.compute_meta(all_idxs_[:, i, ...]) for i in range(splits)]
-  #  x_next = x_[0, ...]
-  #  y1s, y2s, y3s = [], [], []
-  #  for i in range(splits + 2):
-  #    overlap_fn_ = partial(_overlap_fn, moe_methods, i, splits)
+@dataclasses.dataclass
+class AGMeta:
+  gather_idx: jax.Array  # Indices into the global (all-gathered) token buffer
+  group_counts: jax.Array  # Counts for the compute block (local experts)
+  output_mask: jax.Array  # Mask for valid computed tokens (handling padding)
+  info: MoEInfo
 
-  #    meta1 = all_metas[i] if 0 <= i < splits else 0
-  #    y1, meta2 = (y1s[i - 1], all_metas[i - 1]) if 1 <= i < splits + 1 else (None, None)
-  #    y2, meta3 = (y2s[i - 2], all_metas[i - 2]) if 2 <= i < splits + 2 else (None, None)
-  #    y1, y2, y3 = overlap_fn_(y1, y2, meta1, meta2, meta3, x_next, *extra_args)
-  #    x_next = x_[i + 1, ...] if (i < splits - 1) else None
 
-  #    y1, y2, y3, x_next = jax.lax.optimization_barrier((y1, y2, y3, x_next))
+def _create_pipelined_ag_moe(
+    compute_block: Callable[[jax.Array, jax.Array | None], jax.Array] | None = None,
+    scale_block: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
+    *,
+    axis_name: str,
+    experts_per_tok: int,
+    experts_num: int,
+    config: MoEConfig = MoEConfig(),
+) -> MoEMethods:
+  assert config.gathers in ("builtin", "custom", "custom_sc")
+  shard_idx, num_shards = jax.lax.axis_index(axis_name), jax.lax.axis_size(axis_name)
 
-  #    y1s.append(y1) if y1 is not None else None
-  #    y2s.append(y2) if y2 is not None else None
-  #    y3s.append(y3) if y3 is not None else None
-  #  return jnp.concat(y3s, axis=0)
+  def compute_meta(all_idxs: jax.Array):
+    experts_per_shard = experts_num // num_shards
 
-  return fn(x, all_idxs, *extra_args)
+    # Calculate batch size derived from indices
+    total_tokens_all_shards = all_idxs.size // experts_per_tok
+    local_batch_size = total_tokens_all_shards // num_shards
+
+    assert all_idxs.ndim in (1, 2), f"{jax.typeof(all_idxs)=} should be stacked (expert_shards, -1) or tiled (-1,)"
+
+    with jax.named_scope("compute_metadata"):
+      if all_idxs.ndim != 1:
+        all_idxs = all_idxs.reshape(-1)
+      valid_mask = (all_idxs >= shard_idx * experts_per_shard) & (all_idxs < (shard_idx + 1) * experts_per_shard)
+      valid_idxs = jnp.where(valid_mask, all_idxs, SENTINEL_VALUE)
+      all_sizes = jnp.bincount(all_idxs, length=experts_num)
+      local_expert_counts = all_sizes.reshape((num_shards, experts_per_shard))[shard_idx, :]
+      buffer_size = round(local_batch_size * experts_per_tok * config.safety_factor)
+      buffer_size = maybe_pad_size(buffer_size, config.pad_buffers_to_multiple)
+      local_sort = jnp.argsort(valid_idxs)[:buffer_size]
+      total_valid_tokens = jnp.sum(valid_mask)
+      output_mask = jnp.arange(buffer_size) < total_valid_tokens
+      info = MoEInfo(local_batch_size, experts_per_tok, experts_num)
+      return AGMeta(gather_idx=local_sort, group_counts=local_expert_counts, output_mask=output_mask, info=info)
+
+  # compute
+
+  def load_fn():
+    def prepare_fn(x, meta: AGMeta):
+      del meta
+      with jax.named_scope("all_gather_tokens"):
+        all_x = jax.lax.all_gather(x, axis_name, axis=0, tiled=True)
+      return all_x
+
+    def finalize_fn(all_x, meta: AGMeta):
+      with jax.named_scope("local_gather_before"):
+        if config.gathers == "custom":
+          x_sort = jnp.repeat(all_x, experts_per_tok, axis=0)
+          x_sort = unique_gather(x_sort, meta.gather_idx, ad_mode="scatter")
+        else:
+          x_sort = all_x[meta.gather_idx // experts_per_tok, ...]
+      return x_sort
+
+    return prepare_fn, finalize_fn
+
+  def compute_fn(y: jax.Array, meta: AGMeta, *args):
+    with jax.named_scope("compute"):
+      if compute_block is not None:
+        y = compute_block(y, meta.group_counts, *args)
+      y = jnp.where(meta.output_mask, y, 0.0)
+    return y
+
+  def unload_fn():
+    def prepare_fn(y, meta: AGMeta):
+      with jax.named_scope("local_scatter_after"):
+        total_global_tokens = meta.info.batch_size * jax.lax.axis_size(axis_name)
+        global_buffer_shape = (total_global_tokens,) + y.shape[1:]
+        if scale_block is not None:
+          y = scale_block(y, meta.gather_idx)  # allow the user to scale the per-shard tokens
+        scatter_indices = meta.gather_idx // experts_per_tok
+        out_buffer = jnp.zeros(global_buffer_shape, dtype=y.dtype).at[scatter_indices, ...].add(y)
+      return out_buffer
+
+    def finalize_fn(out_buffer, meta: AGMeta):
+      with jax.named_scope("reduce_scatter"):
+        y = jax.lax.psum_scatter(out_buffer, axis_name=axis_name, scatter_dimension=0, tiled=True)
+      return y
+
+    return prepare_fn, finalize_fn
+
+  return MoEMethods(compute_meta, load_fn, compute_fn, unload_fn)

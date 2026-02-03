@@ -1,24 +1,36 @@
 """Simple all-gather simulator for ragged_all_to_all with optional runtime checks via jax.debug."""
 
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 
-from .utils import RA2AMeta
 
-
-def assert_fn(x):
-  assert x
+class RA2AMeta(NamedTuple):
+  input_offsets: jax.Array
+  send_sizes: jax.Array
+  output_offsets: jax.Array
+  recv_sizes: jax
 
 
 def ragged_all_to_all(
     x: jax.Array, out: jax.Array,
     input_offsets: jax.Array, send_sizes: jax.Array,
     output_offsets: jax.Array, recv_sizes: jax.Array,
-    *, axis_name: str = "x", validate_input: bool = False
+    *,
+    axis_name: str = "x", validate_input: bool = False,
 ) -> jax.Array:
 
-  meta = RA2AMeta(input_offsets=input_offsets, send_sizes=send_sizes,
-                  output_offsets=output_offsets, recv_sizes=recv_sizes)
+  if not (input_offsets.shape == send_sizes.shape == output_offsets.shape == recv_sizes.shape):
+    raise ValueError("All ra2a metadata shapes must match")
+  if not input_offsets.shape == (jax.lax.axis_size(axis_name),):
+    raise ValueError("This version of ra2a expects only 1 send packet per shard")
+
+  def assert_fn(x):
+    assert x
+
+  meta = RA2AMeta(input_offsets=input_offsets, send_sizes=send_sizes, output_offsets=output_offsets,
+                  recv_sizes=recv_sizes)
 
   axis_index = jax.lax.axis_index(axis_name)
   x_all = jax.lax.all_gather(x, axis_name=axis_name, tiled=False, axis=0)
@@ -46,7 +58,7 @@ def ragged_all_to_all(
     buf = jax.lax.dynamic_update_slice_in_dim(buf, new_slice, meta_all.output_offsets[i, axis_index], axis=0)
     return buf
 
-  # make the buffer larger by x since we use x-sized slice in the dynamic update slice so that we don't wrap around
+  # make the buffer 2x larger since we use an x-sized slice in the dynamic update slice so that we don't wrap around
   buffer_for_update_ = jnp.concatenate([out, jnp.zeros_like(out, shape=(x.shape[0],) + out.shape[1:])], 0)
   updated_buffer = jax.lax.fori_loop(0, x_all.shape[0], insert, buffer_for_update_)
   updated_buffer = updated_buffer[:out.shape[0], ...]
