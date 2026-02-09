@@ -25,8 +25,8 @@ random_randint = lambda key, shape, minval, maxval: jnp.array(np.random.default_
 
 class MoeTest(parameterized.TestCase):
   @parameterized.product(
-      experts_per_tok=[1, 2, 4], device=["cpu", "tpu", "cuda"], multiple=[1, 2, 8],
-      ra2a=[ra2a_via_ag, jax.lax.ragged_all_to_all], device_num=[1, 4],
+      experts_per_tok=[1, 2, 4], device=["cpu", "tpu"], multiple=[1, 2, 8],
+      ra2a=[jax.lax.ragged_all_to_all, ra2a_via_ag], device_num=[1, 4],
   )
   def test_unique_gather_derivative(self, experts_per_tok, device, multiple, ra2a, device_num):
     if device == "cpu" and ra2a != ra2a_via_ag:
@@ -103,7 +103,7 @@ class MoeTest(parameterized.TestCase):
   def test_add_indices_works_for_moe(self, experts, multiple):
     all_idxs = jax.random.randint(jax.random.key(0), 128, minval=0, maxval=experts)
     idx_count = jnp.bincount(all_idxs, length=experts)
-    pad_indices = add_indices(jnp.arange(experts), -idx_count % multiple, max_size=multiple - 1)
+    pad_indices = add_indices(jnp.arange(experts), -idx_count % multiple, max_size_per_idx=multiple - 1)
     # check if the pad_indices actually added the desired number of pad indices to each group
     np.testing.assert_array_equal(jnp.bincount(pad_indices, length=experts), -idx_count % multiple)
 

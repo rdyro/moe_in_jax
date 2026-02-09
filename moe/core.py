@@ -103,7 +103,7 @@ def run_moe_shard_map(
     if config.multiple != 1:
       fill_experts = -all_shard_sizes % config.multiple
       add_indices_fn = jax.vmap(
-        partial(add_indices, max_size=config.multiple - 1, fill_value=SENTINEL_VALUE), (None, 0)
+        partial(add_indices, max_size_per_idx=config.multiple - 1, fill_value=SENTINEL_VALUE), (None, 0)
       )
       last_expert_per_shard = jnp.arange(num_shards) * experts_per_shard + (experts_per_shard - 1)
       fill_indices = add_indices_fn(last_expert_per_shard, fill_experts)
@@ -150,7 +150,7 @@ def run_moe_shard_map(
     # compute the local permutation
     local_expert_idxs_ = jnp.where(local_pack_mask, local_expert_idxs - shard_idx * experts_per_shard, SENTINEL_VALUE)
     local_group_counts = jnp.sum(all_sizes.reshape((num_shards, num_shards, experts_per_shard))[:, shard_idx, :], 0)
-    local_permute = compute_padded_group_gather(local_expert_idxs_, experts_per_shard, multiple=1,
+    local_permute = compute_padded_group_gather(local_expert_idxs_, experts_per_shard, multiple=config.multiple,
                                                 group_counts=local_group_counts)
     local_group_counts = local_permute.group_counts_with_padding
 
@@ -165,8 +165,9 @@ def run_moe_shard_map(
   with jax.named_scope("tokens_to_experts_gather"):
     if config.gathers == "custom":
       x_sort = jnp.repeat(x, experts_per_tok, axis=0)
-      x_sort = unique_gather(x_sort, meta.local_ra2a_sort, meta.local_ra2a_isort, ad_mode="gather")
+      x_sort = unique_gather(x_sort, meta.local_ra2a_sort, meta.local_ra2a_isort, mode="padded_gather")
     elif config.gathers == "custom_sc":
+      raise NotImplementedError
       x_sort = jnp.repeat(x, experts_per_tok, axis=0)
       x_sort = sc.unique_sc_gather(x_sort, meta.local_ra2a_sort, meta.local_ra2a_isort, ad_mode="gather")
     else:
@@ -185,8 +186,9 @@ def run_moe_shard_map(
     # step 3: gather tokens locally so they're expert-contiguous
     with jax.named_scope("local_gather_before"):
       if config.gathers == "custom":
-        y = unique_gather(y, meta.local_permute.sort_idx, meta.local_permute.isort_idx, ad_mode="gather")
+        y = unique_gather(y, meta.local_permute.sort_idx, meta.local_permute.isort_idx, mode="padded_gather")
       elif config.gathers == "custom_sc":
+        raise NotImplementedError
         y = sc.unique_sc_gather(y, meta.local_permute.sort_idx, meta.local_permute.isort_idx, ad_mode="gather")
       else:
         y = y[meta.local_permute.sort_idx, ...]
@@ -203,8 +205,9 @@ def run_moe_shard_map(
     # step 5: unpermute tokens locally to organize them into chunks in which they arrived
     with jax.named_scope("local_gather_after"):
       if config.gathers == "custom":
-        y = unique_gather(y, meta.local_permute.isort_idx, meta.local_permute.isort_idx, ad_mode="scatter")
+        y = unique_gather(y, meta.local_permute.isort_idx, meta.local_permute.sort_idx, mode="padded_gather")
       elif config.gathers == "custom_sc":
+        raise NotImplementedError
         y = sc.unique_sc_gather(y, meta.local_permute.isort_idx, meta.local_permute.isort_idx, ad_mode="scatter")
       else:
         y = y[meta.local_permute.isort_idx, ...]
@@ -217,9 +220,10 @@ def run_moe_shard_map(
   # step 7: gather so each token repeats are next to each other
   with jax.named_scope("expert_to_tokens_gather"):
     if config.gathers == "custom":
-      y = unique_gather(x_sort, meta.local_ra2a_isort, meta.local_ra2a_isort, ad_mode="scatter")
+      y = unique_gather(x_sort, meta.local_ra2a_isort, meta.local_ra2a_sort, mode="padded_gather")
     elif config.gathers == "custom_sc":
-      y = sc.unique_sc_gather(x_sort, meta.local_ra2a_isort, meta.local_ra2a_isort, ad_mode="scatter")
+      raise NotImplementedError
+      y = sc.unique_sc_gather(x_sort, meta.local_ra2a_isort, meta.local_ra2a_isort)
     else:
       y = x_sort[meta.local_ra2a_isort, ...]
 
