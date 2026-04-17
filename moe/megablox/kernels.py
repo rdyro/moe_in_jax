@@ -55,6 +55,28 @@ def _validate_args(
 
 GroupMetadata = tuple[jax.Array, jax.Array, jax.Array]
 
+def new_make_group_metadata(
+  *,
+  group_sizes: jax.Array,
+  m: int,
+  tm: int,
+) -> tuple[GroupMetadata, jax.Array]:
+  visits_per_group = (group_sizes + tm - 1) // tm
+  group_ends = jnp.cumsum(visits_per_group)
+  group_starts = group_ends - visits_per_group
+  max_grid_size = (m + tm - 1) // tm + group_sizes.size + 1
+  iota = jnp.arange(max_grid_size)
+  groups_mask = ((iota[:, None] >= group_starts[None, :]) & (iota[:, None] < group_ends[None, :]))
+  rhs_group_idx = jnp.sum(groups_mask * jnp.arange(group_sizes.size)[None, :], -1)
+
+  group_offsets = jnp.cumsum(group_sizes) - group_sizes
+  lhs_tile_offset = tm * (jnp.arange(max_grid_size)[:, None] - group_starts[None, :]) + group_offsets[None, :]
+  lhs_tile_offset = jnp.sum(groups_mask * lhs_tile_offset, -1)
+  lhs_tile_size = jnp.ones(max_grid_size, dtype=jnp.int32) * tm
+  lhs_tile_size = lhs_tile_size.at[jnp.where(group_sizes > 0, group_ends - 1, 2 ** 31)].set(group_sizes % tm, mode="drop")
+  return rhs_group_idx, lhs_tile_offset, lhs_tile_size
+
+
 
 def make_group_metadata(
   *,

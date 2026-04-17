@@ -42,7 +42,7 @@ def new_make_group_metadata(*, group_sizes: jax.Array, m: int, tm: int) -> Group
   iota = jnp.arange(max_grid_size)
   groups_mask = ((iota[:, None] >= group_starts[None, :]) & (iota[:, None] < group_ends[None, :]))
   rhs_group_idx = jnp.sum(groups_mask * jnp.arange(group_sizes.size)[None, :], -1)
-  
+
   group_offsets = jnp.cumsum(group_sizes) - group_sizes
   lhs_tile_offset = tm * (jnp.arange(max_grid_size)[:, None] - group_starts[None, :]) + group_offsets[None, :]
   lhs_tile_offset = jnp.sum(groups_mask * lhs_tile_offset, -1)
@@ -62,9 +62,9 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, tiling: tuple[in
   metadata = new_make_group_metadata(group_sizes=group_sizes, m=lhs.shape[0], tm=tiling[0])
   cdiv = lambda a, b: (a + b - 1) // b
   grid = (metadata.actual_tile_number[0], cdiv(n, tile_n), cdiv(k, tile_k))
-  
+
   metadata_hbm_ref = jax.tree.map(jax.new_ref, metadata)
-  
+
   lhs_ref, rhs_ref = jax.new_ref(lhs), jax.new_ref(rhs)
   # out_ref = jax.new_ref(jax.lax.empty((m, n), dtype=lhs.dtype))
   out_ref = jax.new_ref(jnp.zeros((m, n), dtype=lhs.dtype))
@@ -93,30 +93,30 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, tiling: tuple[in
 
       def out_index_map(i, j, k):
         return (pl.ds(multof(metadata_smem_ref.lhs_tile_offset[i]), multof(metadata_smem_ref.lhs_tile_sizes[i])), j)
-        
+
       lhs_spec = pl.BlockSpec((pl.BoundedSlice(tile_m), tile_k), lhs_index_map)
       out_spec = pl.BlockSpec((pl.BoundedSlice(tile_m), tile_n), out_index_map)
       rhs_spec = pl.BlockSpec((None, tile_k, tile_n), rhs_index_map)
-      
+
       def kernel_body(lhs_ref, rhs_ref, out_ref):
         pid = namedtuple("size", ["i", "j", "k"])(*[pl.program_id(i) for i in range(3)])
-        
+
         @pl.when(pid.k == 0)
         def _():
           acc_scratch[...] = jnp.zeros_like(acc_scratch)
-          
+
         acc_scratch[...] += pl.dot(lhs_ref[...], rhs_ref[...]).astype(acc_scratch.dtype)
-        
+
         @pl.when(pid.k == cdiv(k, tile_k) - 1)
         def _():
           out_ref[...] = acc_scratch[...].astype(out_ref.dtype)
-      
+
       pltpu.emit_pipeline(kernel_body, grid=grid, in_specs=[lhs_spec, rhs_spec], out_specs=out_spec)(
         lhs_ref, rhs_ref, out_ref)
-    
+
   return out_ref[...]
 
-  
+
 ########################################################################################################################
 # Tests ################################################################################################################
 ########################################################################################################################
@@ -130,20 +130,20 @@ if __name__ == "__main__":
   keys = iter(jax.random.split(jax.random.key(0), 1024))
   lhs = jax.random.normal(next(keys), (m, k))
   rhs = jax.random.normal(next(keys), (gs.size, k, n))
-  
+
 
   lhs = lhs[padded_gather.sort_idx, ...]
   lhs = jnp.pad(lhs, ((0, 512 - (lhs.shape[0] % 512)), (0, 0)))
   gs = padded_gather.group_counts_with_padding
   assert jnp.all(gs % MULTIPLE == 0)
 
-  
+
   hyperparams = {
     "tile_m": [128, 256, 512],
     "tile_k": [7168, 7168 // 2, 7168 // 4, 7168 // 8],
     "tile_n": [512, 1024, 2048],
   }
-  
+
   @partial(jax.jit, static_argnames=("tile_m", "tile_k", "tile_n"))
   def gmm_(lhs, rhs, group_sizes, tile_m, tile_k, tile_n):
     return gmm(lhs, rhs, group_sizes, tiling=(tile_m, tile_k, tile_n))
@@ -152,7 +152,7 @@ if __name__ == "__main__":
   def gmm2_(lhs, rhs, group_sizes, tile_m, tile_k, tile_n):
     with xla_metadata.set_xla_metadata(ragged_dot_tiling=f"{tile_m},{tile_k},{tile_n}"):
       return jax.lax.ragged_dot(lhs, rhs, group_sizes)
-    
+
   fn = tune_jax.tune(gmm_, hyperparams=hyperparams)
   out1 = fn(lhs, rhs, gs)
   print(tune_jax.tabulate(fn))
@@ -160,7 +160,7 @@ if __name__ == "__main__":
   out2 = fn2(lhs, rhs, gs)
   print(tune_jax.tabulate(fn2))
   breakpoint()
-  
+
 if False:
 
   print("Launching the kernel", flush=True)
@@ -170,20 +170,17 @@ if False:
   print(out)
   print(out[:, 0].reshape((-1, 8)))
   breakpoint()
-  
+
 if False and __name__ == "__main__":
   m = 4096
   gs = random_group_sizes(32, m)
   print(gs)
-  
+
   tm = 16
   rhs_group_idx, lhs_tile_offset, lhs_tile_sizes = new_make_group_metadata(group_sizes=gs, m=m, tm=tm)
   # print(rhs_group_idx)
   assert jnp.all(jnp.bincount(rhs_group_idx, length=gs.size) == (gs + tm - 1) // tm)
   print(jnp.bincount(rhs_group_idx, length=gs.size))
-  
+
   print(lhs_tile_offset)
   print(lhs_tile_sizes)
-  
-
-
