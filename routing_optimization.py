@@ -1,12 +1,15 @@
+from pathlib import Path
+import itertools
+import time
+
 from absl.testing import absltest
 from absl.testing import parameterized
 from functools import partial
-import itertools
-import time
-import z3
-
 import jax
 import jax.numpy as jnp
+import z3
+
+jax.config.update("jax_compilation_cache_dir", str(Path("~/.cache/jax").expanduser()))
 
 
 def indices_to_mask(s: int, indices: jax.Array):
@@ -206,7 +209,7 @@ def optimize(
 
 
 @jax.jit
-def optimize_fairness(
+def optimize_step_by_step(
   chunk_sums: jax.Array,
   cap: int,
   balance_cap: int | None = None,
@@ -228,7 +231,7 @@ def optimize_fairness(
     indicator = jnp.all(jnp.sum(C, axis=0) <= cap)
     if balance_cap is not None:
       indicator &= jnp.all(C <= (balance_cap // n))
-    return jnp.where(indicator, fairness(chunk_sums, mask), -jnp.inf)
+    return jnp.where(indicator, fairness(chunk_sums, mask), -(2**31))
 
   cond = lambda carry: (carry[0] < max_it) & jnp.any(carry[1] != carry[2])
 
@@ -239,12 +242,11 @@ def optimize_fairness(
     objs = jax.vmap(obj_fn, in_axes=(None, 0))(chunk_sums, candidates)
 
     progress = jnp.sum(candidates - indices, axis=-1)
-    # Prefer making progress. If no progress is the only valid option, it stays.
-    objs = jnp.where(
-        objs != -jnp.inf,
-        objs + jnp.where(progress > 0, 1e6, 0) + progress * 1e-3,
-        -jnp.inf
-    )
+    valid = objs > -(2**31)
+    objs = jnp.where(valid, (n * s) * objs + progress, -(2**31))
+
+    # ensure any step forward dominates no steps forward
+    objs = jnp.where(valid & (progress > 0), objs + (2**24), objs)
 
     best_idx = jnp.argmax(objs)
     new_indices = candidates[best_idx, :]
@@ -254,54 +256,13 @@ def optimize_fairness(
   return it, indices
 
 
-@jax.jit
-def optimize_step_by_step(
-  chunk_sums: jax.Array,
-  cap: int,
-  balance_cap: int | None = None,
-  max_it: int = 128,
-  initial_mask: jax.Array | None = None,
-):
-  n, _, s = chunk_sums.shape
-  if initial_mask is not None:
-    mask = initial_mask
-  else:
-    mask = jnp.zeros_like(chunk_sums, dtype=bool)
-
-  def obj_fn(mask):
-    masked_sums = jnp.where(mask, chunk_sums, 0)
-    C = jnp.sum(masked_sums, axis=-1)
-    indicator = jnp.all(jnp.sum(C, axis=0) <= cap)
-    if balance_cap is not None:
-      indicator &= jnp.all(C <= (balance_cap // n))
-    return jnp.where(indicator, fairness(chunk_sums, mask), -jnp.inf)
-
-  cond = lambda carry: (carry[0] < max_it) & jnp.any(carry[1] != carry[2])
-
-  def body(carry):
-    i, mask, _ = carry
-    num_elements = n * n * s
-    eyes = jnp.eye(num_elements, dtype=bool).reshape((num_elements, n, n, s))
-    candidates = mask[None, ...] | eyes
-    valid_flip = (~mask) & (chunk_sums > 0)
-    valid_flip_flat = valid_flip.flatten()
-    objs = jax.vmap(obj_fn)(candidates)
-    objs = jnp.where(valid_flip_flat, objs, -jnp.inf)
-    best_idx = jnp.argmax(objs)
-    best_obj = objs[best_idx]
-    new_mask = jnp.where(best_obj > -jnp.inf, candidates[best_idx], mask)
-    return (i + 1, new_mask, mask)
-
-  it, mask, _ = jax.lax.while_loop(cond, body, (0, mask, jnp.ones_like(mask)))
-  return it, mask
-
-
 class RoutingOptimizationTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
     ("optimize", optimize, "optimize"),
-    ("optimize_fairness", optimize_fairness, "optimize_fairness"),
     ("optimize_step_by_step", optimize_step_by_step, "optimize_step_by_step"),
+    ("optimize_z3", optimize_z3, "optimize_z3"),
+    ("optimize_random", optimize_random, "optimize_random"),
   )
   def test_optimization_loop(self, opt_method, method_name):
     seed = int(time.time_ns()) % (2**31)
@@ -317,13 +278,18 @@ class RoutingOptimizationTest(parameterized.TestCase):
     capacity = 1.5
     print(f"Optimizer: {method_name}")
     for _ in range(5):
-      if method_name == "optimize_step_by_step":
-        it, mask = opt_method(chunk_sums, int(128 * capacity), initial_mask=mask)
-        indices = 1  # mark as not None
+      t = time.perf_counter()
+      if method_name == "optimize_random":
+        mask = opt_method(next(keys), chunk_sums, int(128 * capacity), batch_size=256, steps=8)
+        it = 1
+        indices = 1
       else:
         it, indices = opt_method(chunk_sums, int(128 * capacity), initial_guess=indices)
         mask = indices_to_mask(chunk_sums.shape[-1], indices)
-      print(f"Recv sizes = {jnp.sum(chunk_sums * mask, axis=(-1, 0))}; {it = }")
+      jax.block_until_ready(mask)
+      t = time.perf_counter() - t
+      print(f"Recv sizes = {jnp.sum(chunk_sums * mask, axis=(-1, 0))}; {it = } time = {t:.4e} s")
+      # breakpoint()
 
       chunk_sums = jnp.where(mask, 0, chunk_sums)
       if jnp.sum(chunk_sums) == 0:
@@ -331,8 +297,9 @@ class RoutingOptimizationTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
     ("optimize", optimize, "optimize"),
-    ("optimize_fairness", optimize_fairness, "optimize_fairness"),
     ("optimize_step_by_step", optimize_step_by_step, "optimize_step_by_step"),
+    ("optimize_z3", optimize_z3, "optimize_z3"),
+    ("optimize_random", optimize_random, "optimize_random"),
   )
   def test_optimization_loop_converges(self, opt_method, method_name):
     seed = int(time.time_ns()) % (2**31)
@@ -349,9 +316,9 @@ class RoutingOptimizationTest(parameterized.TestCase):
     chunk_sums_ = chunk_sums
     capacity = 1.5
     for _ in range(64):
-      if method_name == "optimize_step_by_step":
-        it, mask = opt_method(chunk_sums_, int(128 * capacity), initial_mask=mask if indices is not None else None)
-        indices = 1  # mark as not None
+      if method_name == "optimize_random":
+        mask = opt_method(next(keys), chunk_sums_, int(128 * capacity), batch_size=256, steps=8)
+        indices = 1
       else:
         it, indices = opt_method(chunk_sums_, int(128 * capacity), initial_guess=indices)
         mask = indices_to_mask(chunk_sums.shape[-1], indices)
@@ -364,7 +331,6 @@ class RoutingOptimizationTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
     ("optimize", optimize, "optimize", None),
-    ("optimize_fairness", optimize_fairness, "optimize_fairness", None),
     ("optimize_step_by_step", optimize_step_by_step, "optimize_step_by_step", None),
     ("optimize_random", optimize_random, "optimize_random", {"batch_size": [16, 32], "steps": [2, 4]}),
   )
@@ -385,8 +351,6 @@ class RoutingOptimizationTest(parameterized.TestCase):
 
         if method_name == "optimize_random":
           mask = opt_method(key, chunk_sums_, int(128 * capacity), **kwargs)
-        elif method_name == "optimize_step_by_step":
-          _, mask = opt_method(chunk_sums_, int(128 * capacity), initial_mask=indices_or_mask)
         else:
           _, indices = opt_method(chunk_sums_, int(128 * capacity), initial_guess=indices_or_mask)
           mask = indices_to_mask(chunk_sums.shape[-1], indices)
@@ -398,9 +362,7 @@ class RoutingOptimizationTest(parameterized.TestCase):
         done = jnp.sum(chunk_sums_) == 0
 
         # update state for next iteration
-        if method_name == "optimize_step_by_step":
-          next_indices_or_mask = mask
-        elif method_name == "optimize_random":
+        if method_name == "optimize_random":
           next_indices_or_mask = jnp.zeros(chunk_sums.shape[0], dtype=jnp.int32)
         else:
           next_indices_or_mask = indices_or_mask
@@ -411,8 +373,6 @@ class RoutingOptimizationTest(parameterized.TestCase):
       cond = lambda carry: (carry[0] < 32) & (~carry[-1])
 
       init_indices_or_mask = jnp.zeros(chunk_sums.shape[0], dtype=jnp.int32)
-      if method_name == "optimize_step_by_step":
-         init_indices_or_mask = jnp.zeros_like(chunk_sums, dtype=bool)
 
       it, _, _, all_masks, _, _ = jax.lax.while_loop(
         cond,
