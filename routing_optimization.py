@@ -3,6 +3,7 @@ from absl.testing import parameterized
 from functools import partial
 import itertools
 import time
+import z3
 
 import jax
 import jax.numpy as jnp
@@ -72,6 +73,93 @@ def optimize_random(
   objs = jax.vmap(partial(objective, cap=cap, balance_cap=balance_cap), in_axes=(None, 0))(chunk_sums, candidates)
   best_guess = candidates[jnp.argmax(objs), ...]
   return best_guess
+
+
+def optimize_z3(
+  chunk_sums: jax.Array,
+  cap: int,
+  balance_cap: int | None = None,
+  max_it: int = 128,
+  initial_guess: jax.Array | None = None,
+):
+  n, _, s = chunk_sums.shape
+  if initial_guess is not None:
+    indices = initial_guess
+  else:
+    indices = jnp.broadcast_to(initialize_opt(chunk_sums, cap=cap)[None], (n,))
+
+  import numpy as np
+  np_chunk_sums = np.array(chunk_sums)
+  np_indices = np.array(indices)
+
+  for _ in range(max_it):
+    solver = z3.Optimize()
+
+    diffs = [z3.Int(f"d_{i}") for i in range(n)]
+    for i in range(n):
+        solver.add(diffs[i] >= 0)
+        solver.add(diffs[i] <= 1)
+
+    new_indices = []
+    for i in range(n):
+        new_val = int(np_indices[i]) + diffs[i]
+        solver.add(new_val <= s)
+        new_indices.append(new_val)
+
+    C_vars = [[0 for _ in range(n)] for _ in range(n)]
+    for send in range(n):
+        for recv in range(n):
+            for step in range(s):
+                cond = z3.If(step < new_indices[send], int(np_chunk_sums[send, recv, step]), 0)
+                C_vars[send][recv] += cond
+
+    for recv in range(n):
+        recv_sum = sum(C_vars[send][recv] for send in range(n))
+        solver.add(recv_sum <= cap)
+
+    if balance_cap is not None:
+        for send in range(n):
+            for recv in range(n):
+                solver.add(C_vars[send][recv] <= balance_cap // n)
+
+    send_totals = [sum(C_vars[send][recv] for recv in range(n)) for send in range(n)]
+    recv_totals = [sum(C_vars[send][recv] for send in range(n)) for recv in range(n)]
+
+    progress_sum = sum(diffs)
+    solver.add(progress_sum >= 1)
+
+    total_send_sum = sum(send_totals)
+    total_recv_sum = sum(recv_totals)
+
+    max_send_dev = z3.Int("max_send_dev")
+    max_recv_dev = z3.Int("max_recv_dev")
+
+    for send in range(n):
+        solver.add(max_send_dev >= n * send_totals[send] - total_send_sum)
+        solver.add(max_send_dev >= total_send_sum - n * send_totals[send])
+
+    for recv in range(n):
+        solver.add(max_recv_dev >= n * recv_totals[recv] - total_recv_sum)
+        solver.add(max_recv_dev >= total_recv_sum - n * recv_totals[recv])
+
+    max_dev = z3.Int("max_dev")
+    solver.add(max_dev >= max_send_dev)
+    solver.add(max_dev >= max_recv_dev)
+
+    solver.minimize(max_dev)
+    solver.maximize(progress_sum)
+
+    if solver.check() == z3.sat:
+        model = solver.model()
+        progress_val = sum(model[d].as_long() for d in diffs)
+        if progress_val > 0:
+            np_indices = np.array([int(np_indices[i]) + model[diffs[i]].as_long() for i in range(n)])
+        else:
+            break
+    else:
+        break
+
+  return max_it, jnp.array(np_indices)
 
 
 @jax.jit
