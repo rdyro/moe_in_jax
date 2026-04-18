@@ -1,10 +1,11 @@
 from pathlib import Path
 import itertools
 import time
+from typing import Sequence, Any
+from functools import partial
 
 from absl.testing import absltest
 from absl.testing import parameterized
-from functools import partial
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -17,28 +18,36 @@ def indices_to_mask(s: int, indices: jax.Array):
   return jnp.arange(s)[None, None, :] < indices[:, None, None]
 
 
-def is_valid(chunk_sums: jax.Array, cap: int | jax.Array):
-  return jnp.all(jnp.sum(chunk_sums, axis=(-1, 0)) <= cap)
-
-
-def objective(chunk_sums: jax.Array, mask: jax.Array, cap: int, balance_cap: int | None = None):
+def objective(chunk_sums: jax.Array, mask: jax.Array, cap: int):
   n, _, s = chunk_sums.shape
   masked_sums = jnp.where(mask, chunk_sums, 0)
   C = jnp.sum(masked_sums, axis=-1)
-  indicator = jnp.all(jnp.sum(C, axis=0) <= cap)
-  if balance_cap is not None:
-    indicator &= jnp.all(C <= (balance_cap // n))
-  return jnp.where(indicator, jnp.sum(C), -(2**31))
+  violations = jnp.maximum(jnp.sum(C, axis=0) - cap, 0)
+  indicator = jnp.all(violations <= 0)
+  return jnp.where(indicator, jnp.sum(C), -jnp.sum(violations))
 
 
-def fairness(chunk_sums: jax.Array, mask: jax.Array):
-  masked_sums = jnp.where(mask, chunk_sums, 0)
-  C = jnp.sum(masked_sums, axis=-1)
-  send_totals = jnp.sum(C, axis=-1)
-  recv_totals = jnp.sum(C, axis=0)
-  send_fairness = jnp.max(jnp.abs(send_totals - jnp.mean(send_totals)))
-  recv_fairness = jnp.max(jnp.abs(recv_totals - jnp.mean(recv_totals)))
-  return -jnp.maximum(send_fairness, recv_fairness)
+def fairness_objective(chunk_sums: jax.Array, mask: jax.Array):
+  n, _, s = chunk_sums.shape
+  C = jnp.sum(jnp.where(mask, chunk_sums, 0), axis=-1)
+  send_totals, recv_totals = jnp.sum(C, axis=-1), jnp.sum(C, axis=0)
+  send_unfairness = jnp.max(jnp.abs(n * send_totals - jnp.sum(send_totals)))
+  recv_unfairness = jnp.max(jnp.abs(n * recv_totals - jnp.sum(recv_totals)))
+  return jnp.maximum(send_unfairness, recv_unfairness)
+
+
+def get_fairness_objs(chunk_sums: jax.Array, candidates: jax.Array, objs: jax.Array, obj_cutoff: jax.Array):
+  n, _, s = chunk_sums.shape
+  fairness_obj = jax.vmap(fairness_objective, in_axes=(None, 0))(chunk_sums, candidates)
+  fairness_objs = jnp.where(objs >= obj_cutoff, fairness_obj, 2**31 - 1)
+  return -fairness_objs
+
+
+def sample_bernoulli(key: jax.Array, batch_size: int, sample_shape: Sequence[int]):
+  ndim, total_shape = len(sample_shape), (batch_size,) + tuple(sample_shape)
+  key1, key2 = jax.random.split(key)
+  probs = jax.random.uniform(key1, (batch_size,))
+  return jax.random.bernoulli(key2, jnp.expand_dims(probs, tuple(range(1, ndim + 1))), total_shape)
 
 
 def steps_to_consider(s: int, up_only: bool = False):
@@ -58,39 +67,76 @@ def initialize_opt(chunk_sums: jax.Array, cap: int):
   return best_inital
 
 
-@partial(jax.jit, static_argnames=("steps", "batch_size"))
+@partial(jax.jit, static_argnames=("samples",))
 def optimize_random(
+  key: jax.Array, chunk_sums: jax.Array, cap: int, *, samples: int = 128 * 1024, fairness_cutoff: float | None = None
+):
+  n, _, s = chunk_sums.shape
+  candidates = sample_bernoulli(key, samples, (n, 1, s)).at[0, ...].set(True)
+  sample0 = objective(chunk_sums, candidates[0, ...], cap=cap)
+  objs = jax.vmap(partial(objective, cap=cap), in_axes=(None, 0))(chunk_sums, candidates)
+  if fairness_cutoff is not None:
+    objs = get_fairness_objs(chunk_sums, candidates, objs, fairness_cutoff * jnp.max(objs))
+  best_guess = candidates[jnp.argmax(objs), ...]
+  return 1, best_guess
+
+
+@partial(jax.jit, static_argnames=("samples", "max_it"))
+def optimize_random_iterative(
   key: jax.Array,
   chunk_sums: jax.Array,
   cap: int,
-  balance_cap: int | None = None,
-  batch_size: int = 1024,
-  steps: int = 8,
+  *,
+  samples: int = 1024,
+  fairness_cutoff: float | None = None,
+  max_it: int = 128,
+  mutate_prob: float = 0.05,
 ):
   n, _, s = chunk_sums.shape
-  steps = max(min(steps, s), 1)
-  samples = jax.random.randint(key, (batch_size, steps, n, n, s), 0, steps + 1, dtype=jnp.int8)
-  candidates = (samples >= (jnp.arange(steps) + 1)[None, :, None, None, None]).astype(bool).reshape((-1, n, n, s))
-  candidates = candidates.at[0, ...].set(True)
-  sample0 = objective(chunk_sums, candidates[0, ...], cap=cap, balance_cap=balance_cap)
+  key, subkey = jax.random.split(key)
+  candidates = sample_bernoulli(subkey, samples, (n, 1, s)).at[0, ...].set(True)
+  objs = jax.vmap(partial(objective, cap=cap), in_axes=(None, 0))(chunk_sums, candidates)
 
-  objs = jax.vmap(partial(objective, cap=cap, balance_cap=balance_cap), in_axes=(None, 0))(chunk_sums, candidates)
-  best_guess = candidates[jnp.argmax(objs), ...]
-  return best_guess
+  best_idx = jnp.argmax(objs)
+  best_guess = candidates[best_idx, ...]
+
+  def cond(carry):
+    i, _, _, changed = carry
+    return (i < max_it) & changed
+
+  def body(carry):
+    i, key, best_guess, _ = carry
+    key, subkey = jax.random.split(key)
+
+    flip_mask = jax.random.bernoulli(subkey, mutate_prob, (samples, n, 1, s))
+    candidates = jnp.where(flip_mask, ~best_guess[None, ...], best_guess[None, ...])
+    candidates = candidates.at[0, ...].set(best_guess)
+
+    objs = jax.vmap(partial(objective, cap=cap), in_axes=(None, 0))(chunk_sums, candidates)
+    if fairness_cutoff is not None:
+      objs = get_fairness_objs(chunk_sums, candidates, objs, fairness_cutoff * jnp.max(objs))
+    new_best_idx = jnp.argmax(objs)
+    new_best_guess = candidates[new_best_idx, ...]
+    changed = jnp.any(best_guess != new_best_guess)
+
+    return (i + 1, key, new_best_guess, changed)
+
+  its, _, best_guess, _ = jax.lax.while_loop(cond, body, (0, key, best_guess, True))
+  return its, best_guess
 
 
-def optimize_z3(
+def optimize_z3_indices(
+  key: jax.Array,
   chunk_sums: np.ndarray,
   cap: int,
-  balance_cap: int | None = None,
+  *,
   max_it: int = 128,
-  initial_starts: np.ndarray | None = None,
+  fairness_cutoff: float | None = None,
 ):
+  del key, fairness_cutoff
   n, _, s = chunk_sums.shape
-  initial_starts = np.array(initial_starts) if initial_starts is not None else np.zeros(n, "int32")
   chunk_sums = np.array(chunk_sums)
-  mask = initial_starts[:, None, None] > np.arange(s)[None, None, :]
-  existing_sums = np.sum(np.where(mask, chunk_sums, 0), axis=-1)
+  existing_sums = np.sum(chunk_sums, axis=-1)
 
   solver = z3.Optimize()
 
@@ -101,21 +147,19 @@ def optimize_z3(
   # Bounds constraints on variables
   for i in range(n):
     solver.add(diffs[i] >= 0)
-    solver.add(diffs[i] <= max(0, s - initial_starts[i]))
+    solver.add(diffs[i] <= s)
 
   new_indices = []
   for i in range(n):
-    new_val = int(initial_starts[i]) + diffs[i]
-    new_indices.append(new_val)
+    new_indices.append(diffs[i])
 
   # Calculate masked values (C_vars)
   C_vars = [[0 for _ in range(n)] for _ in range(n)]
   for send in range(n):
     for recv in range(n):
       for step in range(s):
-        if chunk_sums[send, recv, step] != 0:
-          cond = z3.If(step < new_indices[send], int(chunk_sums[send, recv, step]), 0)
-          C_vars[send][recv] += cond
+        # if chunk_sums[send, recv, step] != 0:  # making this matrix irregular hurts performance
+        C_vars[send][recv] += z3.If(step < new_indices[send], int(chunk_sums[send, recv, step]), 0)
 
   # Constraints
   # Cap constraint
@@ -123,12 +167,6 @@ def optimize_z3(
     recv_sum = sum(C_vars[send][recv] for send in range(n))
     solver.add(recv_sum <= cap)
     solver.add(recv_sum > 0)
-
-  # Balance cap constraint (optional)
-  if balance_cap is not None:
-    for send in range(n):
-      for recv in range(n):
-        solver.add(C_vars[send][recv] <= balance_cap // n)
 
   # Objectives setup
   send_totals = [sum(C_vars[send][recv] for recv in range(n)) for send in range(n)]
@@ -156,71 +194,47 @@ def optimize_z3(
   # Objectives
   solver.maximize(total_recv_sum)  # primary objective
   solver.minimize(max_recv_dev)  # secondary objective
+  solver.set("timeout", 1000)
 
-  indices = initial_starts
-  if solver.check() == z3.sat:
-    model = solver.model()
-    indices = np.array([int(indices[i]) + model[diffs[i]].as_long() for i in range(n)])
-    return 1, jnp.array(indices)
-  return -1, indices
+  indices = np.zeros(n)
+  if (result := solver.check()) in (z3.sat, z3.unknown):
+    try:
+      model = solver.model()
+      indices = np.array([model[diffs[i]].as_long() for i in range(n)], dtype="int32")
+    except z3.Z3Exception:
+      pass
+  return (1 if result == z3.sat else -1), indices_to_mask(s, indices)
 
 
 def optimize_z3_full(
-  chunk_sums: jax.Array,
+  key: jax.Array,
+  chunk_sums: np.ndarray | list[list[list[int]]],
   cap: int,
-  balance_cap: int | None = None,
+  *,
   max_it: int = 128,
-  initial_mask: jax.Array | None = None,
+  fairness_cutoff: float | None = None,
 ):
+  chunk_sums = np.array(chunk_sums)
   n, _, s = chunk_sums.shape
-  import numpy as np
-
-  np_chunk_sums = np.array(chunk_sums)
-
-  if initial_mask is not None:
-    np_mask = np.array(initial_mask, dtype=bool)
-  else:
-    np_mask = np.zeros((n, n, s), dtype=bool)
+  del key, fairness_cutoff
 
   solver = z3.Optimize()
 
   # We will search over `diffs` mask where each element can be 0 or 1
   # representing whether we flip a specific chunk from False to True
-  diffs = [[[z3.Int(f"d_{i}_{j}_{k}") for k in range(s)] for j in range(n)] for i in range(n)]
-
-  # 0 <= diffs[i][j][k] <= 1
-  for i in range(n):
-    for j in range(n):
-      for k in range(s):
-        solver.add(diffs[i][j][k] >= 0)
-        solver.add(diffs[i][j][k] <= 1)
-        # If it's already True in the mask, or if there are no items to send, we cannot flip it
-        if np_mask[i, j, k] or np_chunk_sums[i, j, k] == 0:
-          solver.add(diffs[i][j][k] == 0)
+  var_mask = [[z3.Bool(f"d_{i}_{k}") for k in range(s)] for i in range(n)]
 
   C_vars = [[0 for _ in range(n)] for _ in range(n)]
   for send in range(n):
     for recv in range(n):
       for step in range(s):
-        # Is step currently true or newly flipped?
-        is_active = z3.If(bool(np_mask[send, recv, step]) or (diffs[send][recv][step] == 1), 1, 0)
-        cond = is_active * int(np_chunk_sums[send, recv, step])
-        C_vars[send][recv] += cond
+        C_vars[send][recv] += z3.If(var_mask[send][step], 1, 0) * int(chunk_sums[send, recv, step])
 
-  for recv in range(n):
-    recv_sum = sum(C_vars[send][recv] for send in range(n))
-    solver.add(recv_sum <= cap)
-
-  if balance_cap is not None:
-    for send in range(n):
-      for recv in range(n):
-        solver.add(C_vars[send][recv] <= balance_cap // n)
-
+  # Cap constraint
   send_totals = [sum(C_vars[send][recv] for recv in range(n)) for send in range(n)]
   recv_totals = [sum(C_vars[send][recv] for send in range(n)) for recv in range(n)]
-
-  progress_sum = sum(diffs[send][recv][step] for send in range(n) for recv in range(n) for step in range(s))
-  solver.add(progress_sum >= 1)
+  for recv in range(n):
+    solver.add(recv_totals[recv] <= cap)
 
   total_send_sum = sum(send_totals)
   total_recv_sum = sum(recv_totals)
@@ -240,264 +254,291 @@ def optimize_z3_full(
   solver.add(max_dev >= max_send_dev)
   solver.add(max_dev >= max_recv_dev)
 
+  solver.maximize(total_recv_sum)
   solver.minimize(max_dev)
-  solver.maximize(progress_sum)
+  solver.set("timeout", 1000)
 
-  if solver.check() == z3.sat:
-    model = solver.model()
-    progress_val = sum(
-      model[diffs[send][recv][step]].as_long() for send in range(n) for recv in range(n) for step in range(s)
-    )
-    if progress_val > 0:
+  mask = np.zeros((n, n, s), dtype=bool)
+  result = solver.check()
+  if result in (z3.sat, z3.unknown):
+    try:
+      model = solver.model()
       for send in range(n):
         for recv in range(n):
           for step in range(s):
-            if model[diffs[send][recv][step]].as_long() == 1:
-              np_mask[send, recv, step] = True
+            mask[send, recv, step] = bool(model[var_mask[send][step]])
+      return 1, np.array(mask)
+    except z3.Z3Exception:
+      pass
+  return -1, mask
 
-  return 1, jnp.array(np_mask)
+
+def optimize_lp_full(
+  key: jax.Array,
+  chunk_sums: np.ndarray | list[list[list[int]]],
+  cap: int,
+  *,
+  max_it: int = 128,
+  fairness_cutoff: float | None = None,
+):
+  import scipy.optimize as opt
+  chunk_sums = np.array(chunk_sums)
+  n, _, s = chunk_sums.shape
+
+  S = np.sum(chunk_sums, axis=1)
+
+  c = [-float(S[i, k]) for i in range(n) for k in range(s)]
+  A_ub = [[float(chunk_sums[i, j, k]) for i in range(n) for k in range(s)] for j in range(n)]
+  b_ub = [float(cap) for _ in range(n)]
+
+  res = opt.linprog(np.array(c), A_ub=np.array(A_ub), b_ub=np.array(b_ub), bounds=(0, 1), integrality=1)
+
+  mask = np.zeros((n, n, s), dtype=bool)
+  if not res.success:
+    return -1, mask
+
+  if fairness_cutoff is None:
+    mask[...] = np.clip(res.x, 0, 1).reshape(n, 1, s) > 0.5
+    return 1, mask
+
+  opt_vol = -res.fun
+  if opt_vol <= 0:
+    return 1, mask
+
+  # Phase 2: Maximize fairness (minimize max_dev)
+  V = n * s
+  c2 = [0.0] * V + [1.0]
+  A_ub2 = [row + [0.0] for row in A_ub]
+  b_ub2 = list(b_ub)
+
+  # Cutoff constraint: total_vol >= cutoff * opt_vol => -total_vol <= -cutoff * opt_vol
+  A_ub2.append(c + [0.0])
+  b_ub2.append(-float(fairness_cutoff) * opt_vol)
+
+  # Deviation constraints
+  for i_target in range(n):
+    row_pos = [float((n - 1) * S[i, k] if i == i_target else -S[i, k]) for i in range(n) for k in range(s)]
+    A_ub2.append(row_pos + [-1.0])
+    b_ub2.append(0.0)
+
+    row_neg = [float(-(n - 1) * S[i, k] if i == i_target else S[i, k]) for i in range(n) for k in range(s)]
+    A_ub2.append(row_neg + [-1.0])
+    b_ub2.append(0.0)
+
+  for j_target in range(n):
+    row_pos = [float(n * chunk_sums[i, j_target, k] - S[i, k]) for i in range(n) for k in range(s)]
+    A_ub2.append(row_pos + [-1.0])
+    b_ub2.append(0.0)
+
+    row_neg = [float(-(n * chunk_sums[i, j_target, k] - S[i, k])) for i in range(n) for k in range(s)]
+    A_ub2.append(row_neg + [-1.0])
+    b_ub2.append(0.0)
+
+  bounds2 = [(0, 1)] * V + [(0, None)]
+  integrality2 = [1] * V + [0]
+
+  res2 = opt.linprog(np.array(c2), A_ub=np.array(A_ub2), b_ub=np.array(b_ub2), bounds=bounds2, integrality=integrality2)
+
+  if res2.success:
+    mask[...] = np.clip(res2.x[:-1], 0, 1).reshape(n, 1, s) > 0.5
+    return 1, mask
+
+  mask[...] = np.clip(res.x, 0, 1).reshape(n, 1, s) > 0.5
+  return 1, mask
 
 
 @jax.jit
-def optimize(
-  chunk_sums: jax.Array,
-  cap,
-  balance_cap: int | None = None,
-  max_it=128,
-  initial_guess=None,
-  fairness_cutoff: float | None = None,
-):
+def optimize_indices(key: jax.Array, chunk_sums: jax.Array, cap, *, max_it=128, fairness_cutoff: float | None = None):
+  del key
   n, _, s = chunk_sums.shape
-  if initial_guess is not None:
-    indices = initial_guess
-  else:
-    indices = jnp.broadcast_to(initialize_opt(chunk_sums, cap=cap)[None], (n,))
+  indices = jnp.broadcast_to(initialize_opt(chunk_sums, cap=cap)[None], (n,))
+  assert indices.shape == (n,)
 
-  floor = 0 if initial_guess is None else initial_guess
-
-  obj_fn = lambda chunk_sums, indices: objective(
-    chunk_sums, indices_to_mask(s, indices), cap=cap, balance_cap=balance_cap
-  )
+  obj_fn = lambda chunk_sums, indices: objective(chunk_sums, indices_to_mask(s, indices), cap=cap)
   cond = lambda carry: (carry[0] < max_it) & jnp.any(carry[1] != carry[2])
 
   def body(carry):
     i, indices, _ = carry
     diffs = steps_to_consider(n)
-    candidates = jnp.clip(indices[None, :] + diffs, floor, s)
+    candidates = jnp.clip(indices[None, :] + diffs, 0, s)
     objs = jax.vmap(obj_fn, in_axes=(None, 0))(chunk_sums, candidates)
 
     objs = objs + jnp.sum((candidates - indices) / (n + 1) / 2, axis=-1)  # tie breaking
     objs = jnp.where(objs > 0, (2 * n + 1) * objs + jnp.sum(candidates - indices, axis=-1), objs)
-
     if fairness_cutoff is not None:
-      raise NotImplementedError("This path doesn't work.")
-    else:
-      best_idx = jnp.argmax(objs)
-
-    new_indices = candidates[best_idx, :]
+      masks = jax.vmap(partial(indices_to_mask, s))(candidates)
+      objs = get_fairness_objs(chunk_sums, masks, objs, fairness_cutoff * jnp.max(objs))
+    new_indices = candidates[jnp.argmax(objs), :]
     return (i + 1, new_indices, indices)
 
   it, indices, _ = jax.lax.while_loop(cond, body, (0, indices, indices - 1))
-  return it, indices
+  return it, indices_to_mask(s, indices)
 
 
-@jax.jit
-def optimize_step_by_step(
-  chunk_sums: jax.Array,
-  cap: int,
-  balance_cap: int | None = None,
-  max_it: int = 128,
-  initial_guess: jax.Array | None = None,
-):
+@partial(jax.jit, static_argnames=("solver", "opts"))
+def find_partition(key: jax.Array, chunk_sums: jax.Array, capacity, solver=None, opts: tuple[str, Any] = ()):
   n, _, s = chunk_sums.shape
-  if initial_guess is not None:
-    indices = initial_guess
-  else:
-    indices = jnp.broadcast_to(initialize_opt(chunk_sums, cap=cap)[None], (n,))
+  assert chunk_sums.shape == (n, n, s)
+  solver = solver if solver is not None else optimize_random_iterative
 
-  floor = 0 if initial_guess is None else initial_guess
+  def find_masks(carry):
+    i, key, chunk_sums, prev_mask, all_masks = carry
+    next_key, key = jax.random.split(key)
+    it, mask = solver(key, chunk_sums, capacity, **dict(opts))
+    assert mask.shape == (n, 1, s)
+    mask = mask & (~prev_mask)
+    chunk_sums = jnp.where(mask, 0, chunk_sums)
+    all_masks = all_masks.at[i, ...].set(mask)
+    return (i + 1, key, chunk_sums, mask | prev_mask, all_masks)
 
-  def obj_fn(chunk_sums, indices):
-    mask = indices_to_mask(s, indices)
-    masked_sums = jnp.where(mask, chunk_sums, 0)
-    C = jnp.sum(masked_sums, axis=-1)
-    indicator = jnp.all(jnp.sum(C, axis=0) <= cap)
-    if balance_cap is not None:
-      indicator &= jnp.all(C <= (balance_cap // n))
-    return jnp.where(indicator, fairness(chunk_sums, mask), -(2**31))
-
-  cond = lambda carry: (carry[0] < max_it) & jnp.any(carry[1] != carry[2])
-
-  def body(carry):
-    i, indices, _ = carry
-    diffs = steps_to_consider(n, up_only=True)
-    candidates = jnp.clip(indices[None, :] + diffs, floor, s)
-    objs = jax.vmap(obj_fn, in_axes=(None, 0))(chunk_sums, candidates)
-
-    progress = jnp.sum(candidates - indices, axis=-1)
-    valid = objs > -(2**31)
-    objs = jnp.where(valid, (n * s) * objs + progress, -(2**31))
-
-    # ensure any step forward dominates no steps forward
-    objs = jnp.where(valid & (progress > 0), objs + (2**24), objs)
-
-    best_idx = jnp.argmax(objs)
-    new_indices = candidates[best_idx, :]
-    return (i + 1, new_indices, indices)
-
-  it, indices, _ = jax.lax.while_loop(cond, body, (0, indices, indices - 1))
-  return it, indices
+  all_masks = jnp.zeros((32, n, 1, s), dtype=bool)
+  cond = lambda carry: (carry[0] < 32) & (jnp.sum(carry[2]) > 0)
+  existing_mask = jnp.zeros((n, 1, s), dtype=bool)
+  it, _, _, _, all_masks = jax.lax.while_loop(cond, find_masks, (0, key, chunk_sums, existing_mask, all_masks))
+  return it, all_masks
 
 
 class RoutingOptimizationTest(parameterized.TestCase):
   @parameterized.named_parameters(
-    ("optimize", optimize, "optimize"),
-    ("optimize_step_by_step", optimize_step_by_step, "optimize_step_by_step"),
-    ("optimize_z3", optimize_z3, "optimize_z3"),
-    # ("optimize_z3_full", optimize_z3_full, "optimize_z3_full"),
-    ("optimize_random", optimize_random, "optimize_random"),
+    ("optimize_indices", optimize_indices, "optimize_indices", None),
+    ("optimize_z3_indices", optimize_z3_indices, "optimize_z3_indices", None),
+    ("optimize_z3_full", optimize_z3_full, "optimize_z3_full", None),
+    ("optimize_lp_full", optimize_lp_full, "optimize_lp_full", None),
+    ("optimize_random_iterative", optimize_random_iterative, "optimize_random_iterative", None),
+    ("optimize_indices_fair", optimize_indices, "optimize_indices", 0.95),
+    ("optimize_z3_indices_fair", optimize_z3_indices, "optimize_z3_indices", 0.95),
+    ("optimize_z3_full_fair", optimize_z3_full, "optimize_z3_full", 0.95),
+    ("optimize_random_fair", optimize_random, "optimize_random", 0.95),
+    ("optimize_lp_full_fair", optimize_lp_full, "optimize_lp_full_fair", 0.95),
+    ("optimize_random_iterative_fair", optimize_random_iterative, "optimize_random_iterative", 0.95),
   )
-  def test_optimization_loop(self, opt_method, method_name):
+  def test_optimization_loop_perf(self, opt_method, method_name, fairness_cutoff):
     seed = int(time.time_ns()) % (2**31)
     keys = iter(jax.random.split(jax.random.key(seed), 1024))
     num_shards = 4
     total = 128
-    num_splits = 32
+    num_splits = 16
     chunk_sums = jnp.round(
       total * jax.nn.softmax(jax.random.gumbel(next(keys), (num_shards, num_shards, num_splits)), axis=-1)
     ).astype(jnp.int32)
 
-    indices, mask = None, None
-    capacity = 1.5
-    print(f"Optimizer: {method_name}")
-    for _ in range(5):
+    it, var, mask, capacity = 1, None, None, 1.5
+    for i in range(10):
+      # with jax.profiler.trace(f"/tmp/profile_{method_name}"):
       t = time.perf_counter()
-      if method_name == "optimize_random":
-        mask = opt_method(next(keys), chunk_sums, int(128 * capacity), batch_size=256, steps=8)
-        it = 1
-        indices = 1
-      elif method_name == "optimize_z3_full":
-        it, mask = opt_method(chunk_sums, int(128 * capacity), initial_mask=mask)
-        indices = 1
-      elif method_name == "optimize_z3":
-        it, indices = opt_method(chunk_sums, int(128 * capacity), initial_starts=indices)
-        mask = indices_to_mask(chunk_sums.shape[-1], indices)
-      else:
-        it, indices = opt_method(chunk_sums, int(128 * capacity), initial_guess=indices)
-        mask = indices_to_mask(chunk_sums.shape[-1], indices)
-      jax.block_until_ready(mask)
+      it, mask = opt_method(next(keys), chunk_sums, int(128 * capacity), fairness_cutoff=fairness_cutoff)
+      jax.block_until_ready((mask, var))
       t = time.perf_counter() - t
-      print(f"Recv sizes = {jnp.sum(chunk_sums * mask, axis=(-1, 0))}; {it = } time = {t:.4e} s")
+      # if method_name == "optimize_lp_full":
+      #   breakpoint()
 
-      chunk_sums = jnp.where(mask, 0, chunk_sums)
-      if jnp.sum(chunk_sums) == 0:
+      assert (mask.shape[0], mask.shape[2]) == (chunk_sums.shape[0], chunk_sums.shape[2])
+      C = np.sum(chunk_sums * mask, axis=-1)
+      print(f"recv sizes = {np.sum(C, 0)}; send sizes = {np.sum(C, -1)}; {int(it) = } time = {t:.4e} s")
+
+      chunk_sums = np.where(mask, 0, chunk_sums)
+      if np.sum(chunk_sums) == 0:
+        print(f"Optimizer: {method_name}_{'fair' if fairness_cutoff is not None else ''} converges in {i + 1} its")
         break
 
   @parameterized.named_parameters(
-    ("optimize", optimize, "optimize"),
-    ("optimize_step_by_step", optimize_step_by_step, "optimize_step_by_step"),
-    ("optimize_z3", optimize_z3, "optimize_z3"),
+    ("optimize_indices", optimize_indices, "optimize_indices"),
+    ("optimize_z3_indices", optimize_z3_indices, "optimize_z3_indices"),
     ("optimize_z3_full", optimize_z3_full, "optimize_z3_full"),
+    ("optimize_lp_full", optimize_lp_full, "optimize_lp_full"),
     ("optimize_random", optimize_random, "optimize_random"),
+    ("optimize_random_iterative", optimize_random_iterative, "optimize_random_iterative"),
   )
   def test_optimization_loop_converges(self, opt_method, method_name):
     seed = int(time.time_ns()) % (2**31)
     keys = iter(jax.random.split(jax.random.key(seed), 1024))
     num_shards = 4
     total = 128
-    num_splits = 32
+    num_splits = 16
     chunk_sums = jnp.round(
       total * jax.nn.softmax(jax.random.gumbel(next(keys), (num_shards, num_shards, num_splits)), axis=-1)
     ).astype(jnp.int32)
 
-    indices = None
-    mask = jnp.ones_like(chunk_sums, dtype=bool)
-    chunk_sums_ = chunk_sums
-    capacity = 1.5
-    for _ in range(64):
-      if method_name == "optimize_random":
-        mask = opt_method(next(keys), chunk_sums_, int(128 * capacity), batch_size=256, steps=8)
-        indices = 1
-      elif method_name == "optimize_z3_full":
-        it, mask = opt_method(chunk_sums_, int(128 * capacity), initial_mask=mask if indices is not None else None)
-        indices = 1
-      else:
-        it, indices = opt_method(chunk_sums_, int(128 * capacity), initial_guess=indices)
-        mask = indices_to_mask(chunk_sums.shape[-1], indices)
-
-      chunk_sums_ = chunk_sums_ * ~mask
-      if jnp.sum(chunk_sums_) == 0:
+    it, indices, capacity, mask = 1, None, 1.5, None
+    for i in range(10):
+      it, mask = opt_method(next(keys), chunk_sums, int(128 * capacity))
+      assert (mask.shape[0], mask.shape[2]) == (chunk_sums.shape[0], chunk_sums.shape[2])
+      C = jnp.sum(chunk_sums * mask, axis=-1)
+      print(f"Recv sizes = {jnp.sum(chunk_sums * mask, axis=(-1, 0))}; {int(it) = }")
+      chunk_sums = jnp.where(mask, 0, chunk_sums)
+      if jnp.sum(chunk_sums) == 0:
+        print(f"Optimizer: {method_name} converges in {i + 1} iterations")
         break
-
-    self.assertEqual(jnp.sum(chunk_sums_), 0)
+    self.assertEqual(jnp.sum(chunk_sums), 0)
 
   @parameterized.named_parameters(
-    ("optimize", optimize, "optimize", None),
-    ("optimize_step_by_step", optimize_step_by_step, "optimize_step_by_step", None),
-    ("optimize_z3", optimize_z3, "optimize_z3", None),
-    ("optimize_z3_full", optimize_z3_full, "optimize_z3_full", None),
-    ("optimize_random", optimize_random, "optimize_random", {"batch_size": [16, 32], "steps": [2, 4]}),
+    ("optimize_indices", optimize_indices, "optimize_indices", None),
+    ("optimize_lp_full", optimize_lp_full, "optimize_lp_full", None),
+    ("optimize_lp_full_fair", optimize_lp_full, "optimize_lp_full", {"fairness_cutoff": [0.95]}),
+    ("optimize_random", optimize_random, "optimize_random", {"samples": [128, 256]}),
+    (
+      "optimize_random_iterative",
+      optimize_random_iterative,
+      "optimize_random_iterative",
+      {"samples": [128, 256], "mutate_prob": [0.05, 0.1], "max_it": [8, 16, 32]},
+    ),
   )
   def test_efficacy(self, opt_method, method_name, kwargs_dict):
+    WITH_PROFILING = False
     seed = int(time.time_ns()) % (2**31)
     keys = iter(jax.random.split(jax.random.key(seed), 1024))
     num_shards = 4
-    total = 128
-    num_splits = 32
+    per_shard_total = 128
+    num_splits = 16
     chunk_sums = jnp.round(
-      total * jax.nn.softmax(jax.random.gumbel(next(keys), (num_shards, num_shards, num_splits)), axis=-1)
+      per_shard_total * jax.nn.softmax(jax.random.gumbel(next(keys), (num_shards, num_shards, num_splits)), axis=-1)
     ).astype(jnp.int32)
-    capacity = 1.5
+    capacity = per_shard_total * 1.5
 
+    TRIALS = 32
+
+    @partial(jax.jit, static_argnames=("kwargs",))
     def check_efficacy(kwargs):
-      def find_new_mask(key, carry):
-        i, chunk_sums_, prev_mask, all_masks, indices_or_mask, _ = carry
+      kwargs = dict(kwargs)
 
-        if method_name == "optimize_random":
-          mask = opt_method(key, chunk_sums_, int(128 * capacity), **kwargs)
-        elif method_name == "optimize_z3_full":
-          _, mask = opt_method(chunk_sums_, int(128 * capacity), initial_mask=indices_or_mask)
-          indices_or_mask = mask
-        else:
-          _, indices = opt_method(chunk_sums_, int(128 * capacity), initial_guess=indices_or_mask)
-          mask = indices_to_mask(chunk_sums.shape[-1], indices)
-          indices_or_mask = indices
+      def find_its(key, _):
+        new_key, key = jax.random.split(key)
+        mask = jnp.zeros_like(chunk_sums, dtype=bool)
+        all_masks = jnp.zeros((32,) + chunk_sums.shape, dtype=bool)
+        opts = tuple(kwargs.items())
+        it, all_masks = find_partition(key, chunk_sums, capacity=capacity, solver=opt_method, opts=opts)
+        return new_key, it
 
-        mask = mask & (~prev_mask)
-        chunk_sums_ = jnp.where(mask, 0, chunk_sums_)
-        all_masks = all_masks.at[i, ...].set(mask)
-        done = jnp.sum(chunk_sums_) == 0
+      _, its = jax.lax.scan(find_its, jax.random.key(0), None, length=TRIALS)
+      return jnp.stack([jnp.arange(8), jnp.bincount(its, length=8)], 0)
 
-        # update state for next iteration
-        if method_name == "optimize_random":
-          next_indices_or_mask = jnp.zeros(chunk_sums.shape[0], dtype=jnp.int32)
-        else:
-          next_indices_or_mask = indices_or_mask
+    if WITH_PROFILING:
+      import tune_jax
 
-        return (i + 1, chunk_sums_, mask | prev_mask, all_masks, next_indices_or_mask, done)
-
-      all_masks = jnp.zeros((32, *chunk_sums.shape), dtype=bool)
-      cond = lambda carry: (carry[0] < 32) & (~carry[-1])
-
-      if method_name == "optimize_z3_full":
-        init_indices_or_mask = jnp.zeros_like(chunk_sums, dtype=bool)
+      tune_jax.logger.setLevel("INFO")
+      if kwargs_dict is None:
+        fn = tune_jax.tune(partial(check_efficacy, ()))
+        it_hist = fn()
+        elapsed = fn.timing_results[0].t_mean / TRIALS
+        print(f"For {method_name} histogram is:\n{it_hist}\nin {elapsed:.4e} s")
       else:
-        init_indices_or_mask = jnp.zeros(chunk_sums.shape[0], dtype=jnp.int32)
-
-      it, _, _, all_masks, _, _ = jax.lax.while_loop(
-        cond,
-        partial(find_new_mask, jax.random.key(1)),
-        (0, chunk_sums, jnp.zeros_like(chunk_sums, dtype=bool), all_masks, init_indices_or_mask, False),
-      )
-      return it, all_masks
-
-    if kwargs_dict is None:
-      it, masks = check_efficacy({})
+        dict_keys, values = zip(*kwargs_dict.items(), strict=True)
+        for v in itertools.product(*values):
+          kwargs = tuple(zip(dict_keys, v, strict=True))
+          fn = tune_jax.tune(partial(check_efficacy, kwargs))
+          it_hist = fn()
+          elapsed = fn.timing_results[0].t_mean / TRIALS
+          print(f"For {method_name} with {kwargs} histogram is:\n{it_hist}\nin {elapsed:.4e} s")
     else:
-      dict_keys, values = zip(*kwargs_dict.items(), strict=True)
-      for v in itertools.product(*values):
-        kwargs = dict(zip(dict_keys, v, strict=True))
-        it, masks = check_efficacy(kwargs)
+      if kwargs_dict is None:
+        it_hist = check_efficacy()
+        print(f"For {method_name} histogram is:\n{it_hist}")
+      else:
+        dict_keys, values = zip(*kwargs_dict.items(), strict=True)
+        for v in itertools.product(*values):
+          kwargs = tuple(zip(dict_keys, v, strict=True))
+          it_hist = check_efficacy(kwargs)
+          print(f"For {method_name} with {kwargs} histogram is:\n{it_hist}")
 
 
 if __name__ == "__main__":
